@@ -1,0 +1,24 @@
+[project]
+name = "deepagla"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "librosa>=0.11.0",
+    "pesq>=0.0.4",
+    "pytorch-lightning>=2.5.1.post0",
+    "torch>=2.7.0",
+    "torch-pesq>=0.1.2",
+    "torchaudio>=2.7.0",
+    "torchmetrics>=1.7.1",
+    "torchvision>=0.22.0",
+    "wandb>=0.19.11",
+    "pystoi>=0.4.1",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.29.5",
+    "matplotlib>=3.10.3",
+]
