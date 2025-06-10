@@ -18,6 +18,6 @@ class MelAudioDataset(Dataset):
         return self.mel.shape[0]
 
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor]:
-        mel = torch.from_numpy(self.mel[idx]).float()
-        wav = torch.from_numpy(self.audio[idx]).float()
+        mel = torch.tensor(self.mel[idx], dtype=torch.float32)
+        wav = torch.tensor(self.audio[idx], dtype=torch.float32)
         return mel, wav

@@ -80,6 +80,51 @@ class WaveformL1(nn.Module):
         return F.l1_loss(pred, target)
 
 
+class PhaseOnlyLoss(nn.Module):
+    """
+    Phase-only loss from:
+      S. Takaki et al., STFT Spectral Loss for Training a Neural Speech Waveform Model,
+      ICASSP 2019, Eq. (10)/(15) . https://arxiv.org/pdf/1810.11945
+    """
+    def __init__(self, n_fft=1024, hop_length=256, voiced_weighting=False):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop = hop_length
+        self.win = torch.hann_window(n_fft)          # Hann window (paper default)
+        self.voiced_weighting = voiced_weighting     # if True, expect mask in forward
+
+    def stft_phase(self, x):
+        """
+        x : (B, T) waveform in -1…1 range
+        returns phase tensor (B, F, Frames)
+        """
+        X = torch.stft(
+            x,
+            n_fft=self.n_fft,
+            hop_length=self.hop,
+            window=self.win.to(x.device),
+            center=True,
+            return_complex=True
+        )
+        return torch.angle(X)                        # phase ∈ (-π, π]
+
+    def forward(self, target, pred, voiced_mask=None):
+        """
+        target, pred : (B, T) tensors
+        voiced_mask  : (B, Frames) bool/float, 1 = voiced; used only if voiced_weighting
+        """
+        phi_t = self.stft_phase(target)
+        phi_p = self.stft_phase(pred)
+
+        delta = torch.atan2(torch.sin(phi_p - phi_t), torch.cos(phi_p - phi_t))
+
+        phase_err = 1.0 - torch.cos(delta)
+
+        if self.voiced_weighting and voiced_mask is not None:
+            phase_err = phase_err * voiced_mask.unsqueeze(1)
+
+        return phase_err.mean()
+
 # Combined spectral and waveform losses
 class CompositeLoss(nn.Module):
     """
@@ -96,6 +141,7 @@ class CompositeLoss(nn.Module):
         "l1": WaveformL1(),
         "mag_l2": SpectralMagnitudeL2(),
         "sc": SpectralConvergence(),
+        "phase": PhaseOnlyLoss()
     }
 
     def __init__(self, weights: Dict[str, float] | None = None):

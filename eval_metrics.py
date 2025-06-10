@@ -15,7 +15,7 @@ def ssnr_db(
 ) -> float:
     """
     Compute Spectral-SNR in dB on STFT magnitudes. \\
-    A higher value ⇒ better reconstruction (0dB is perfect).
+    Perfect reconstruction → +∞ dB; higher is better.
     """
     if pred.shape != target.shape:
         raise ValueError("pred and target must have the same shape")
@@ -43,20 +43,24 @@ def ssnr_db(
 
 
 _sisdr_metric = ScaleInvariantSignalDistortionRatio().cpu()
-_sdr_metric = SignalDistortionRatio().cpu()
 def si_sdr_db(pred: torch.Tensor, target: torch.Tensor) -> float:
     """
     Scale-Invariant Signal to Distrotion Ratio (in dB)
     """
+    pred   = pred.detach().float().view(1, -1)
+    target = target.detach().float().view(1, -1)
     _sisdr_metric.reset()
     _sisdr_metric(pred.cpu(), target.cpu())
     return float(_sisdr_metric.compute().item())
 
 
+_sdr_metric = SignalDistortionRatio().cpu()
 def sdr_db(pred: torch.Tensor, target: torch.Tensor) -> float:
     """
     Regular SDR (dB)
     """
+    pred   = pred.detach().float().view(1, -1)
+    target = target.detach().float().view(1, -1)
     _sdr_metric.reset()
     _sdr_metric(pred.cpu(), target.cpu())
     return float(_sdr_metric.compute().item())

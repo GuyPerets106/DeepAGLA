@@ -4,29 +4,33 @@ import urllib.request
 from pathlib import Path
 from random import randint
 from typing import List
-from definitions import *
+
 import numpy as np
-import torch
-import torchaudio
+import soundfile as sf
+import librosa
 from tqdm import tqdm
 
-MEL_TRANSFORM = torchaudio.transforms.MelSpectrogram(SAMPLE_RATE, n_fft=N_FFT, hop_length=HOP, n_mels=N_MELS).to("cpu")
+from definitions import *  # SAMPLE_RATE, N_FFT, HOP, N_MELS, …
 
-SLR_URL1 = "https://openslr.org/resources/134/saspeech_gold_standard_v1.0.tar.gz" # Roboshaul data (Gold Standard Only)
-SLR_URL2 = "https://openslr.org/resources/134/saspeech_automatic_data_v1.0.tar.gz" # TODO Add Roboshaul data (Automatic Data Only)
+SLR_URL1 = ("https://openslr.org/resources/134/saspeech_gold_standard_v1.0.tar.gz")  # Gold‑standard subset
+SLR_URL2 = ("https://openslr.org/resources/134/saspeech_automatic_data_v1.0.tar.gz")  # Automatic subset (unused here)
 
 
 def download_data(dest: Path) -> Path:
-    """
-    Download and extract SLR-134 to *dest/wavs*; return that path
-    """
+    """Download and extract SLR‑134 (gold standard) into *dest/wavs* and
+    return that folder path. Skips download if the archive already exists."""
     dest.mkdir(parents=True, exist_ok=True)
     archive = dest / "saspeech_gold_standard_v1.0.tar.gz"
 
     if not archive.exists():
-        print("▸ Downloading Roboshaul Gold Standard Dataset (967MB)")
-        with tqdm(unit="B", unit_scale=True, unit_divisor=1024,
-                  desc="  Progress", miniters=1) as t:
+        print("▸ Downloading Roboshaul Gold Standard Dataset (≈967 MB)")
+        with tqdm(
+            unit="B",
+            unit_scale=True,
+            unit_divisor=1024,
+            desc="  Progress",
+            miniters=1,
+        ) as t:
 
             def hook(blocks: int, block_size: int, total_size: int):
                 if total_size > 0:
@@ -43,10 +47,9 @@ def download_data(dest: Path) -> Path:
     print(f"▸ WAVs extracted to {wav_root}")
     return wav_root
 
+
 def median_length(samples_list: List[int]) -> int:
-    """
-    Return the median of a list of ints
-    """
+    """Return the median of a list of integers."""
     samples_sorted = sorted(samples_list)
     mid = len(samples_sorted) // 2
     return (
@@ -56,86 +59,127 @@ def median_length(samples_list: List[int]) -> int:
     )
 
 
-def force_length(wav: torch.Tensor, target_len: int) -> torch.Tensor:
-    """
-    Crop (random) or loop a waveform to exactly target_len samples
-    """
-    cur = wav.size(-1)
+def force_length(wav: np.ndarray, target_len: int) -> np.ndarray:
+    """Crop *or* loop a 1‑D waveform to exactly *target_len* samples."""
+    cur = wav.shape[-1]
     if cur == target_len:
         return wav
     if cur > target_len:  # random crop
         start = randint(0, cur - target_len)
         return wav[start : start + target_len]
-    # loop
+    # loop / repeat
     reps = target_len // cur + 1
-    wav = wav.repeat(reps)[:target_len]
-    return wav
+    return np.tile(wav, reps)[:target_len]
+
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--wav_dir", type=Path, required=False, help="folder of *.wav files")
-    ap.add_argument("--data_dir", type=Path, required=True, help="output folder")
-    ap.add_argument("--download", action="store_true", help=f"fetch from {SLR_URL} automatically")
-    args = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--wav_dir", type=Path, help="folder of *.wav files")
+    parser.add_argument("--data_dir", type=Path, required=True, help="output folder")
+    parser.add_argument(
+        "--download",
+        action="store_true",
+        help=f"fetch Roboshaul data automatically from {SLR_URL1}",
+    )
+    args = parser.parse_args()
 
     if args.download:
         if args.wav_dir is not None:
-            ap.error("Use --download OR --wav_dir, not both.")
+            parser.error("Use --download *or* --wav_dir, not both.")
         wav_root = download_data(args.data_dir)
     elif args.wav_dir is None:
-        ap.error("Must supply --wav_dir or --download")
+        parser.error("Must supply --wav_dir or --download")
     else:
         wav_root = args.wav_dir
 
     wav_paths = sorted(p for p in wav_root.rglob("*.wav"))
     if not wav_paths:
-        raise RuntimeError("No .wav files found")
+        raise RuntimeError("No .wav files found in the provided directory")
 
     print("▸ Scanning durations …")
     lengths: List[int] = []
     for p in tqdm(wav_paths, unit="file"):
-        info = torchaudio.info(str(p))
-        sr = info.sample_rate
-        dur = info.num_frames
+        info = sf.info(str(p))
+        sr = info.samplerate
+        frames = info.frames
         if sr != SAMPLE_RATE:
-            dur = int(dur * SAMPLE_RATE / sr)
-        lengths.append(dur)
+            frames = int(frames * SAMPLE_RATE / sr)
+        lengths.append(frames)
 
     med_len = median_length(lengths)
-    print(f"• Median Length = {med_len / SAMPLE_RATE:.2f} s  ({med_len} samples)")
+    print(f"• Median Length = {med_len / SAMPLE_RATE:.2f} s  ({med_len} samples)")
 
-    # Pre-allocate output arrays
     N = len(wav_paths)
     mel_frames = (med_len // HOP) + 1
     audio_buf = np.empty((N, med_len), dtype=np.float32)
-    mel_buf   = np.empty((N, N_MELS, mel_frames), dtype=np.float32)
+    mel_buf = np.empty((N, N_MELS, mel_frames), dtype=np.float32)
+
+    mel_basis = librosa.filters.mel(
+        sr=SAMPLE_RATE,
+        n_fft=N_FFT,
+        n_mels=N_MELS,
+        fmin=FMIN,
+        fmax=FMAX,
+        htk=False,
+    )
 
     print("▸ Processing & buffering arrays")
     for i, p in enumerate(tqdm(wav_paths, unit="file")):
-        wav, sr = torchaudio.load(str(p))
-        wav = wav.mean(0)  # 1-channel
-
+        wav, sr = sf.read(p, dtype="float32")
+        if wav.ndim == 2:
+            wav = wav.mean(axis=1)
         if sr != SAMPLE_RATE:
-            wav = torchaudio.functional.resample(wav, sr, SAMPLE_RATE)
+            wav = librosa.resample(wav, orig_sr=sr, target_sr=SAMPLE_RATE)
 
-        wav = wav / torch.max(torch.abs(wav)).clamp_min(1e-8)  # normalize to [-1,1]
-        wav = force_length(wav, med_len)
+        wav /= max(np.abs(wav).max(), 1e-8)
+        wav  = force_length(wav, med_len)
+        audio_buf[i] = wav
 
-        audio_buf[i] = wav.numpy()
+        mag  = np.abs(librosa.stft(wav, n_fft=N_FFT, hop_length=HOP,win_length=N_FFT, window='hann'))        
+        power = mag**2
+        mel = mel_basis @ power
 
-        mel = MEL_TRANSFORM(wav)[:mel_frames]
-        mel_db = 10 * np.log10(mel.numpy() + np.finfo(np.float32).eps)
-        mel_db = mel_db - mel_db.max() # 0db peak
-        mel_buf[i] = mel_db.astype(np.float32)
+        cur_frames = mel.shape[1]
+        if cur_frames < mel_frames:
+            mel = np.pad(
+                mel,
+                pad_width=((0, 0), (0, mel_frames - cur_frames)),
+                mode="constant",
+                constant_values=0.0,
+            )
+        elif cur_frames > mel_frames:
+            mel = mel[:, :mel_frames]
 
-    # ------------------------------------------------------------------ #
-    # One-shot save → valid .npy with header
+        mel_buf[i] = mel.astype(np.float32)
+
+    print("▸ Running dataset sanity check …")
+    mel_inv = np.linalg.pinv(mel_basis)  # Inverse mel basis
+    wav  = audio_buf[0]
+    mel  = mel_buf[0]
+    mag_hat = mel_inv @ mel      # or mel_inv.T if that's what you store
+    mel_hat = mel_basis @ mag_hat
+
+    l2_rel = np.mean((mel - mel_hat) ** 2) / np.mean(mel ** 2)
+    print(f"   Mel round-trip relative L2 error: {l2_rel:.4e}")
+    assert l2_rel < 1e-2, "Mel ↔ mag mismatch is too large!"
+    recon  = librosa.istft(librosa.stft(wav, n_fft=N_FFT, hop_length=HOP,
+                                        win_length=N_FFT, window='hann'),
+                        hop_length=HOP, win_length=N_FFT, window='hann',
+                        length=len(wav))
+    pcm_err = np.mean(np.abs(wav - recon))
+    print(f"   STFT/iSTFT L1 error: {pcm_err:.4e}")
+    assert pcm_err < 1e-5, "STFT parameters are not perfect-reconstruction!"
+
+    print("✔ Sanity checks passed.")
+    # --------------------------------------------
+
     args.data_dir.mkdir(parents=True, exist_ok=True)
-    np.save(f"{args.data_dir}/audio.npy", audio_buf)
-    np.save(f"{args.data_dir}/mel.npy", mel_buf)
+    np.save(args.data_dir / "audio.npy", audio_buf)
+    np.save(args.data_dir / "mel.npy", mel_buf)
 
     print("✔ Saved arrays to", args.data_dir)
+
 
 if __name__ == "__main__":
     main()

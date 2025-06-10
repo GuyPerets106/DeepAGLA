@@ -218,3 +218,98 @@ def accelerated_griffin_lim(
     # Final inverse transform: T†(c_N)
     y = librosa.istft(c, hop_length=hop_length, win_length=win_length, window=window, length=length)
     return y
+
+def accelerated_griffin_lim_from_mel(
+    M,
+    *,
+    sr: int,
+    n_fft: int,
+    hop_length: int | None = None,
+    win_length: int | None = None,
+    fmin: float = 0.0,
+    fmax: float | None = None,
+    power: float = 1.0,          # 1.0 → magnitude-mel, 2.0 → power-mel
+    n_iter: int = 60,
+    alpha: float = 0.2,
+    beta: float = 0.8,
+    gamma: float = 0.99,
+    init: str = "random",
+    length: int | None = None,
+    random_state: int | None = None,
+):
+    """
+    Reconstructs a time-domain signal from a **mel spectrogram** using the
+    Accelerated Griffin-Lim algorithm (Perraudin et al., 2013).
+
+    Parameters
+    ----------
+    M : np.ndarray [shape=(n_mels, n_frames)]
+        Mel-spectrogram (magnitude or power, controlled by ``power``).
+    sr, n_fft, hop_length, win_length : int
+        STFT parameters (must match those used to create ``M``).
+    fmin, fmax : float
+        Lower / upper frequency limits of the mel filter bank.
+    power : {1.0, 2.0}
+        If 1.0 ``M`` is magnitude-mel, if 2.0 ``M`` is power-mel.
+    n_iter, alpha, beta, gamma, init, length, random_state
+        See ``accelerated_griffin_lim`` documentation.
+
+    Returns
+    -------
+    y : np.ndarray
+        Reconstructed time-domain signal.
+    """
+
+    # ------------------------------------------------------------------
+    # 1) MEL → linear-frequency magnitude
+    # ------------------------------------------------------------------
+    #
+    # librosa provides a numerically robust pseudo-inverse:
+    #   librosa.feature.inverse.mel_to_stft
+    #
+    # power controls the (.)**(1/power) conversion so that
+    # power=2.0 treats M as power-mel and returns magnitude STFT.
+    #
+    S_mag = librosa.feature.inverse.mel_to_stft(
+        M,
+        sr=sr,
+        n_fft=n_fft,
+        power=power,
+        fmin=fmin,
+        fmax=fmax,
+    )
+
+    # ------------------------------------------------------------------
+    # 2) Run accelerated Griffin-Lim on the linear spectrogram
+    # ------------------------------------------------------------------
+    rng = np.random.default_rng(random_state)
+
+    if init == "random":
+        phase = np.exp(2j * np.pi * rng.random(S_mag.shape))
+    elif init == "zeros":
+        phase = np.ones_like(S_mag, dtype=np.complex64)
+    else:
+        raise ValueError("init must be 'random' or 'zeros'")
+
+    c = S_mag * phase
+    t = c.copy()
+    d = c.copy()
+
+    for _ in range(n_iter):
+        x = librosa.istft(c, hop_length=hop_length, win_length=win_length, length=length)
+        C = librosa.stft(x, n_fft=n_fft, hop_length=hop_length, win_length=win_length)
+
+        phase_proj = C / np.maximum(1e-8, np.abs(C))
+        C_proj = S_mag * phase_proj                        # PC₂
+        x_consistent = librosa.istft(C_proj, hop_length=hop_length,
+                                     win_length=win_length, length=length)
+        C_consistent = librosa.stft(x_consistent, n_fft=n_fft,
+                                    hop_length=hop_length, win_length=win_length)
+
+        t_new = (1 - gamma) * d + gamma * C_consistent     # tₙ
+        c_new = t_new + alpha * (t_new - t)                # cₙ
+        d_new = t_new + beta * (t_new - t)                 # dₙ
+
+        t, c, d = t_new, c_new, d_new
+
+    return librosa.istft(c, hop_length=hop_length, win_length=win_length, length=length)

@@ -1,14 +1,17 @@
 from typing import Dict, Tuple
 
 import math
+from numpy import fmin
 import torch
 import torch.nn as nn
 import pytorch_lightning as pl
+import wandb
+import librosa
 from torch import Tensor
-from loss import CompositeLoss
+from loss import CompositeLoss, WaveformL1, PhaseOnlyLoss
+from eval_metrics import evaluate_batch
 from torchaudio.transforms import MelSpectrogram
 from definitions import *
-
 
 def _stft(x: Tensor, n_fft: int = N_FFT, hop: int = HOP, win_length: int | None = None,
           window: Tensor | None = None) -> Tensor:
@@ -18,6 +21,7 @@ def _stft(x: Tensor, n_fft: int = N_FFT, hop: int = HOP, win_length: int | None 
         window = torch.hann_window(win_length, device=x.device, dtype=x.dtype)
     return torch.stft(x, n_fft=n_fft, hop_length=hop, win_length=win_length,
                       window=window, return_complex=True, center=True, pad_mode="reflect")
+
 
 
 def _istft(z: Tensor, n_fft: int = N_FFT, hop: int = HOP, win_length: int | None = None,
@@ -51,12 +55,14 @@ class AGLALayer(nn.Module):
     """
     Single Accelerated Griffin-Lim iteration with learnable parameters
     """
-    def __init__(self, init_alpha: float = 0.1, init_beta: float = 1.1, init_gamma: float = 0.2):
+    def __init__(self, init_alpha: float = 0.1, init_beta: float = 1.1, init_gamma: float = 0.2) -> None:
         super().__init__()
         self.u_alpha = nn.Parameter(torch.tensor(math.atanh(2 * init_alpha - 1), dtype=torch.float32))
         self.u_beta  = nn.Parameter(torch.tensor(math.log(init_beta), dtype=torch.float32))
         self.u_gamma = nn.Parameter(torch.tensor(math.atanh(init_gamma - 1), dtype=torch.float32))
 
+        # self.reset_parameters(init_alpha, init_beta, init_gamma)
+        
     @staticmethod
     def _max_alpha(beta: Tensor, gamma: Tensor) -> Tensor:
         """
@@ -66,15 +72,55 @@ class AGLALayer(nn.Module):
         max_a = torch.where(mask, (1 - 1/gamma) * beta + 1/gamma - 0.5, 1.0 / (2 * beta * (gamma - 1) + gamma) - 0.5)
         # Numerical floor to keep >0
         return torch.clamp(max_a, min=1e-4)
+    
+    def _max_beta(self, gamma: Tensor) -> Tensor:
+        """ Max β allowed by Eq. (9): 2β|1-γ| < 2-γ """
+        mask = gamma <= 1.0
+        out = torch.where(
+            mask,
+            (2.0 - gamma) / (2.0 * (1.0 - gamma + 1e-6)),
+            (2.0 - gamma) / (2.0 * (gamma - 1.0 + 1e-6))
+        )
+        return torch.clamp(out, min=1e-4)
+    
+    def reset_parameters(self, init_alpha, init_beta, init_gamma):
+        with torch.no_grad():
+            device = self.u_gamma.device
+            dtype  = self.u_gamma.dtype          # keep fp32 or fp16 consistent
 
-    def _constrained_params(self) -> Tuple[Tensor, Tensor, Tensor]:
-        """
-        Map unconstrained params (alpha, beta, gamma) in the admissible domain
-        """
-        gamma = torch.tanh(self.u_gamma) + 1 # (0, 2)
-        beta  = torch.exp(self.u_beta) # (0, inf)
-        alpha_raw = (torch.tanh(self.u_alpha) + 1) * 0.5
-        alpha = alpha_raw * self._max_alpha(beta, gamma)
+            # ---- γ ----------------------------------------------------------
+            # forward map: γ = 1 + 0.5 * (1 + tanh uγ)
+            # inverse:     uγ = atanh(2γ - 3)
+            gamma = torch.as_tensor(init_gamma, dtype=dtype, device=device)
+            self.u_gamma.copy_(torch.atanh(2 * gamma - 3))   # tensor → OK
+
+            # ---- β ----------------------------------------------------------
+            beta_max = self._max_beta(gamma)
+            beta = torch.as_tensor(init_beta, dtype=dtype, device=device)
+            if beta >= beta_max:
+                beta = 0.999 * beta_max
+            p_beta = beta / beta_max
+            self.u_beta.copy_(torch.logit(p_beta))
+
+            # ---- α ----------------------------------------------------------
+            alpha_max = self._max_alpha(beta, gamma)
+            alpha = torch.as_tensor(init_alpha, dtype=dtype, device=device)
+            if alpha >= alpha_max:
+                alpha = 0.999 * alpha_max
+            p_alpha = alpha / alpha_max
+            self.u_alpha.copy_(torch.logit(p_alpha))
+            
+    def _constrained_params(self):
+        gamma = 1 + 0.5 * (1 + torch.tanh(self.u_gamma))
+
+        # smooth upper bound for β
+        beta_max = self._max_beta(gamma)
+        beta = beta_max * torch.sigmoid(self.u_beta)
+
+        # smooth upper bound for α
+        alpha_max = self._max_alpha(beta, gamma)
+        alpha = alpha_max * torch.sigmoid(self.u_alpha)
+
         return alpha, beta, gamma
 
     def forward(self, c_prev: Tensor, t_prev: Tensor, d_prev: Tensor, target_mag: Tensor,
@@ -109,7 +155,7 @@ class DeepAGLA(pl.LightningModule):
 
     def __init__(
         self,
-        n_layers: int = 6,
+        n_layers: int = N_LAYERS,
         n_fft: int = N_FFT,
         hop: int = HOP,
         win_length: int | None = None,
@@ -117,32 +163,35 @@ class DeepAGLA(pl.LightningModule):
         lr: float = LEARNING_RATE,
         weight_decay: float = WEIGHT_DECAY,
         loss_weights: Dict[str, float] | None = None,
+        initial_params: Dict[str, float] | None = None,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
 
         self.n_fft = int(n_fft)
+        self.sample_rate = int(sample_rate)
         self.hop = int(hop)
         self.win_length = int(win_length) if win_length is not None else self.n_fft
         self.register_buffer("window", torch.hann_window(self.win_length), persistent=False)
 
-        self.mel = MelSpectrogram(
-            sample_rate=sample_rate,
-            n_fft=self.n_fft,
-            hop_length=self.hop,
+        mel_fb_np = librosa.filters.mel(
+            sr=SAMPLE_RATE, 
+            n_fft=N_FFT, 
             n_mels=N_MELS,
-            power=1.0,
-            center=True,
-        )
-        fb = self.mel.mel_scale.fb
-        self.register_buffer("mel_fb", fb, persistent=False)
+            fmin=FMIN, fmax=FMAX, 
+            htk=False)
+        mel_fb = torch.from_numpy(mel_fb_np).float()
+        self.register_buffer("mel_fb", mel_fb, persistent=False)
         self._mel_inv: Tensor | None = None
         
         # Learnable iteration stack
-        self.layers = nn.ModuleList([AGLALayer() for _ in range(n_layers)])
+        init_alpha = initial_params["alpha"]
+        init_beta = initial_params["beta"]
+        init_gamma = initial_params["gamma"]
+        self.layers = nn.ModuleList([AGLALayer(init_alpha, init_beta, init_gamma) for _ in range(n_layers)])
 
-        # Loss
-        self.criterion = CompositeLoss(loss_weights) # ! Consider use other loss functions
+        weights = dict(mrstft=1.0, mag_l2=0.5, sc=0.5, l1=0.05)
+        self.criterion = CompositeLoss(weights=weights)
 
     def forward(self, mag: Tensor, length: int = None) -> Tensor:
         """
@@ -158,9 +207,35 @@ class DeepAGLA(pl.LightningModule):
 
         # Final ISTFT
         audio = _istft(c, self.n_fft, self.hop, self.win_length, self.window, length=length)
-        # Clamp to [-1, 1] for stable training
         return torch.clamp(audio, -1.0, 1.0)
+    
+    def on_fit_start(self):
+        # Take one batch from the val loader
+        batch = next(iter(self.trainer.datamodule.val_dataloader()))
+        mel, target = batch
+        mel = mel.to(self.device)
+        target = target.to(self.device)
 
+        # Linear-mag inversion check
+        mag_hat = self._mel_to_mag(mel)
+        mel_hat = torch.matmul(self.mel_fb, mag_hat)             # F x T
+        l2_rel  = torch.mean((mel - mel_hat) ** 2) / torch.mean(mel ** 2)
+
+        # STFT perfect-reconstruction check on the first waveform
+        recon = _istft(_stft(target[0], self.n_fft, self.hop, self.win_length,
+                             self.window), self.n_fft, self.hop, self.win_length,
+                       self.window, length=target.shape[-1])
+        pcm_err = torch.mean(torch.abs(target[0] - recon))
+
+        # Log and assert
+        self.log_dict(
+            {"sanity/mel_L2rel":  l2_rel,
+             "sanity/stft_L1":    pcm_err},
+            prog_bar=False, on_step=False, on_epoch=False
+        )
+        if l2_rel > 1e-2 or pcm_err > 1e-5:
+            raise RuntimeError("Sanity check failed: dataset or STFT config inconsistent.")
+        
     def training_step(self, batch, batch_idx):
         mel, target_audio = batch
         target_mag = self._mel_to_mag(mel)
@@ -171,30 +246,112 @@ class DeepAGLA(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         mel, target_audio = batch
-        target_mag = self._mel_to_mag(mel)
-        pred_audio = self(target_mag, length=target_audio.shape[-1])
-        loss = self.criterion(pred_audio, target_audio)
-        self.log("val/loss", loss, prog_bar=True, on_epoch=True, sync_dist=True)
+        pred_audio = self(self._mel_to_mag(mel), length=target_audio.size(-1))
+
+        metrics = evaluate_batch(pred_audio, target_audio, fs=SAMPLE_RATE)
+
+        # --------------- log per epoch ------------------
+        for k, v in metrics.items():
+            tag = k.replace("(", "").replace(")", "").replace("-", "_")
+            self.log(f"val/{tag}", v,
+                    on_step=False, on_epoch=True,
+                    prog_bar=False, sync_dist=True)
+        
+        loss    = self.criterion(pred_audio, target_audio)
+
+        # log batch-wise so PL aggregates mean for us
+        self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+
+        # keep first sample of first batch
+        if batch_idx == 1 and self.trainer.is_global_zero:
+            clip = pred_audio[0].detach().cpu()
+            peak = clip.abs().max()
+            if peak > 0:
+                clip = clip / peak
+            five_sec = SAMPLE_RATE * 5
+            clip = clip[:five_sec] if clip.numel() >= five_sec else \
+                torch.nn.functional.pad(clip, (0, five_sec - clip.numel()), mode="constant", value=0.0)
+            self._val_clip = clip            # store for epoch_end hook
+
         return loss
+
+    def on_validation_epoch_end(self):
+        if not isinstance(self.logger, pl.loggers.WandbLogger):
+            return
+        if getattr(self, "_val_clip", None) is None:
+            return
+
+        self.logger.experiment.log(
+            {
+                "val/reconstructed_audio": wandb.Audio(
+                    self._val_clip.numpy(), sample_rate=SAMPLE_RATE,
+                    caption=f"Reconstructed – epoch {self.current_epoch}"
+                )
+            },
+            commit=True,
+            step=self.global_step,
+        )
+        del self._val_clip
 
     def test_step(self, batch, batch_idx):
         mel, target_audio = batch
-        target_mag = self._mel_to_mag(mel)
-        pred_audio = self(target_mag, length=target_audio.shape[-1])
-        loss = self.criterion(pred_audio, target_audio)
-        self.log("test/loss", loss, prog_bar=False)
-        return {"loss" : loss, "pred_audio" : pred_audio}
+        target_mag  = self._mel_to_mag(mel)
+        pred_audio  = self(target_mag, length=target_audio.shape[-1])
 
+        metrics = evaluate_batch(pred_audio, target_audio, fs=SAMPLE_RATE)
+        loss    = self.criterion(pred_audio, target_audio)
+
+        self.log("test/loss", loss,
+                 prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+
+        for name, value in metrics.items():
+            self.log(f"test/avg_{name}", torch.as_tensor(value, device=self.device),
+                     prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+
+        return {"loss": loss, "pred_audio": pred_audio}
+        
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+        agla_params  = [p for m in self.layers for p in m.parameters()]
+        other_params = [p for p in self.parameters() if p not in agla_params]
 
-    def _mel_to_mag(self, mel: Tensor) -> Tensor:
+        optimizer = torch.optim.Adam(
+            [
+                {"params": agla_params,  "weight_decay": 0.0},
+                {"params": other_params, "weight_decay": self.hparams.weight_decay},
+            ],
+            lr= self.hparams.lr,
+        )
+
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="max",
+            factor=0.5,
+            patience=3,
+            min_lr=1e-5,
+            verbose=True,
+        )
+
+        return {
+            "optimizer":  optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "monitor": "val/SSNRdB",
+                "interval":  "epoch",
+                "frequency": 1,
+            },
+        }
+    
+    def _mel_to_mag(self, mel: torch.Tensor) -> torch.Tensor:
+        """
+        Mel-magnitude (B, 1024, T) ➜ STFT-magnitude (B, 2049, T)
+        using the exact pseudo-inverse of the librosa filterbank.
+        """
         mel = mel.transpose(-2, -1)
 
         if self._mel_inv is None:
-            self._mel_inv = torch.linalg.pinv(self.mel_fb).to(self.mel_fb)
+            self._mel_inv = torch.linalg.pinv(self.mel_fb).mT
 
-        mag = mel @ self._mel_inv
-        mag = mag.transpose(-2, -1).contiguous()
+        mag_hat = torch.sqrt(mel @ self._mel_inv)
+        mag = mag_hat.transpose(-2, -1).clamp(min=1e-8)
 
-        return torch.clamp(mag, min=0.0)
+        return mag

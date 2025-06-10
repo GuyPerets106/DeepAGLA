@@ -4,13 +4,14 @@ from pathlib import Path
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.loggers import WandbLogger
-import torchaudio
 from torch.utils.data import DataLoader, random_split
 
 from dataset import MelAudioDataset
 from deep_agla import DeepAGLA
 from definitions import *
 
+import torch
+torch.set_float32_matmul_precision("high")
 
 class MelDataModule(pl.LightningDataModule):
     """
@@ -54,7 +55,7 @@ class MelDataModule(pl.LightningDataModule):
             batch_size=self.bs,
             shuffle=True,
             num_workers=self.nw,
-            persistent_workers=True,
+            pin_memory=True,
         )
 
     def val_dataloader(self):
@@ -63,7 +64,7 @@ class MelDataModule(pl.LightningDataModule):
             batch_size=self.bs,
             shuffle=False,
             num_workers=self.nw,
-            persistent_workers=True,
+            pin_memory=True,
         )
 
     def test_dataloader(self):
@@ -72,23 +73,32 @@ class MelDataModule(pl.LightningDataModule):
             batch_size=self.bs,
             shuffle=False,
             num_workers=self.nw,
-            persistent_workers=True,
+            pin_memory=True,
         )
 
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--data_dir", type=Path, required=True)
-    p.add_argument("--n_layers", type=int, default=6)
+    p.add_argument("--n_layers", type=int, default=N_LAYERS)
     p.add_argument("--lr", type=float, default=LEARNING_RATE)
     p.add_argument("--batch_size", type=int, default=BATCH_SIZE)
     p.add_argument("--max_epochs", type=int, default=NUM_EPOCHS)
+    p.add_argument("--project", type=str, default="deep-agla")
+    p.add_argument("--mode", type=str, default="convergence", choices=["convergence", "overall"])
     args = p.parse_args()
 
-    model = DeepAGLA(n_layers=args.n_layers, lr=args.lr)
+
+    loss_weights = {
+        "mrstft": 1.0,
+        "l1":     10.0,
+        "phase":  0.2
+        }
+
+    model = DeepAGLA(n_layers=args.n_layers, lr=args.lr, loss_weights=loss_weights, initial_params=BEST_INITIAL_COMBINATIONS[args.mode])
     dm = MelDataModule(args.data_dir, args.batch_size)
 
-    logger = WandbLogger(project="deep-agla")
-    ckpt_cb = ModelCheckpoint(monitor="val/loss", mode="min", save_top_k=1)
+    logger = WandbLogger(project=args.project)
+    ckpt_cb = ModelCheckpoint(monitor="val/SSNRdB", mode="max", save_top_k=1)
     lr_cb = LearningRateMonitor(logging_interval="step")
 
     trainer = pl.Trainer(
