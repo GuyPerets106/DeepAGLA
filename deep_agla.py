@@ -86,7 +86,7 @@ class AGLALayer(nn.Module):
     def reset_parameters(self, init_alpha, init_beta, init_gamma):
         with torch.no_grad():
             device = self.u_gamma.device
-            dtype  = self.u_gamma.dtype          # keep fp32 or fp16 consistent
+            dtype  = self.u_gamma.dtype
 
             # ---- γ ----------------------------------------------------------
             # forward map: γ = 1 + 0.5 * (1 + tanh uγ)
@@ -152,7 +152,6 @@ class DeepAGLA(pl.LightningModule):
     """
     Stack of L AGLA layers trained with a composite spectrogram + waveform loss
     """
-
     def __init__(
         self,
         n_layers: int = N_LAYERS,
@@ -178,7 +177,9 @@ class DeepAGLA(pl.LightningModule):
             sr=SAMPLE_RATE, 
             n_fft=N_FFT, 
             n_mels=N_MELS,
-            fmin=FMIN, fmax=FMAX, 
+            fmin=FMIN, 
+            fmax=FMAX,
+            norm=None,
             htk=False)
         mel_fb = torch.from_numpy(mel_fb_np).float()
         self.register_buffer("mel_fb", mel_fb, persistent=False)
@@ -193,20 +194,18 @@ class DeepAGLA(pl.LightningModule):
         weights = dict(mrstft=1.0, mag_l2=0.5, sc=0.5, l1=0.05)
         self.criterion = CompositeLoss(weights=weights)
 
-    def forward(self, mag: Tensor, length: int = None) -> Tensor:
-        """
-        Run L accelerated iterations and return the reconstructed waveform
-        """
-        # Initialise with zero‑phase
-        c = mag.clone()  # real‑valued mag (magnitude) promoted to complex when multiplied
-        c = c * torch.exp(torch.zeros_like(c) * 1j)
+    def forward(self, mel_mag: Tensor) -> Tensor:  # noqa: D401
+        """Run the Griffin‑Lim stack and return a waveform clipped to [−1, 1]."""
+        mag = self._mel_to_mag(mel_mag)                                       # (B, 1025, T)
+
+        # Zero‑phase initialisation
+        c = mag * torch.exp(torch.zeros_like(mag).real * 1j)
         t = d = proj_C1(c, self.n_fft, self.hop, self.win_length, self.window)
 
         for layer in self.layers:
             c, t, d = layer(c, t, d, mag, n_fft=self.n_fft, hop=self.hop, win_length=self.win_length, window=self.window)
 
-        # Final ISTFT
-        audio = _istft(c, self.n_fft, self.hop, self.win_length, self.window, length=length)
+        audio = _istft(c, self.n_fft, self.hop, self.win_length, self.window)
         return torch.clamp(audio, -1.0, 1.0)
     
     def on_fit_start(self):
@@ -341,17 +340,14 @@ class DeepAGLA(pl.LightningModule):
             },
         }
     
-    def _mel_to_mag(self, mel: torch.Tensor) -> torch.Tensor:
+    def _mel_to_mag(self, mel_mag: torch.Tensor) -> torch.Tensor:
         """
-        Mel-magnitude (B, 1024, T) ➜ STFT-magnitude (B, 2049, T)
-        using the exact pseudo-inverse of the librosa filterbank.
+        Mel power ➜ linear-frequency magnitude.
+        Returns shape (B, 1 + n_fft//2, T); never NaN.
         """
-        mel = mel.transpose(-2, -1)
-
+        mel_mag = mel_mag.transpose(-2, -1)                # (B, T, 200)
         if self._mel_inv is None:
-            self._mel_inv = torch.linalg.pinv(self.mel_fb).mT
-
-        mag_hat = torch.sqrt(mel @ self._mel_inv)
-        mag = mag_hat.transpose(-2, -1).clamp(min=1e-8)
-
+            self._mel_inv = torch.linalg.pinv(self.mel_fb).mT   # (200, 1025)
+        lin_power = torch.matmul(mel_mag, self._mel_inv).clamp(min=1e-8)
+        mag = lin_power.transpose(-2, -1)           # (B, 1025, T)
         return mag
