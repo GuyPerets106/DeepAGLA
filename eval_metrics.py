@@ -18,7 +18,7 @@ def ssnr_db(
     Perfect reconstruction → +∞ dB; higher is better.
     """
     if pred.shape != target.shape:
-        raise ValueError("pred and target must have the same shape")
+        raise ValueError(f"pred and target must have the same shape: got Pred {pred.shape} != Target {target.shape}")
 
     window = torch.hann_window(win_length or n_fft, device=pred.device)
 
@@ -45,10 +45,10 @@ def ssnr_db(
 _sisdr_metric = ScaleInvariantSignalDistortionRatio().cpu()
 def si_sdr_db(pred: torch.Tensor, target: torch.Tensor) -> float:
     """
-    Scale-Invariant Signal to Distrotion Ratio (in dB)
+    Scale-Invariant Signal-to-Distortion Ratio (dB)
     """
-    pred   = pred.detach().float().view(1, -1)
-    target = target.detach().float().view(1, -1)
+    pred   = pred.detach().float().reshape(1, -1)    # <-- contiguous-safe
+    target = target.detach().float().reshape(1, -1)
     _sisdr_metric.reset()
     _sisdr_metric(pred.cpu(), target.cpu())
     return float(_sisdr_metric.compute().item())
@@ -57,10 +57,10 @@ def si_sdr_db(pred: torch.Tensor, target: torch.Tensor) -> float:
 _sdr_metric = SignalDistortionRatio().cpu()
 def sdr_db(pred: torch.Tensor, target: torch.Tensor) -> float:
     """
-    Regular SDR (dB)
+    Signal-to-Distortion Ratio (dB)
     """
-    pred   = pred.detach().float().view(1, -1)
-    target = target.detach().float().view(1, -1)
+    pred   = pred.detach().float().reshape(1, -1)    # <-- contiguous-safe
+    target = target.detach().float().reshape(1, -1)
     _sdr_metric.reset()
     _sdr_metric(pred.cpu(), target.cpu())
     return float(_sdr_metric.compute().item())

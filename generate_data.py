@@ -10,7 +10,7 @@ import numpy as np
 import soundfile as sf
 from tqdm import tqdm
 import audio_utilities
-from definitions import SAMPLE_RATE, N_FFT, HOP, N_MELS, FMIN, FMAX, N_LIN
+from definitions import SAMPLE_RATE, N_FFT, HOP, N_LIN
 
 SLR_URL_GOLD = "https://openslr.org/resources/134/saspeech_gold_standard_v1.0.tar.gz"
 SLR_URL_AUTO = "https://openslr.org/resources/134/saspeech_automatic_data_v1.0.tar.gz"

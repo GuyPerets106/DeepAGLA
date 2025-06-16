@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 import math
 import torch
@@ -12,58 +12,93 @@ from eval_metrics import evaluate_batch
 from definitions import *          # SAMPLE_RATE, N_FFT, HOP, etc.
 import audio_utilities
 
+
 # -------------------------------------------------------------------------
 # STFT helpers
 # -------------------------------------------------------------------------
-def _stft(x: Tensor,
-          n_fft: int = N_FFT,
-          hop:   int = HOP,
-          win_length: int | None = None,
-          window: Tensor | None = None) -> Tensor:
-    
-    if win_length is None:
-        win_length = n_fft
-    if window is None:
-        window = torch.hann_window(win_length, device=x.device, dtype=x.dtype)
+def _align(pred: Tensor, target: Tensor) -> tuple[Tensor, Tensor]:
+    """Crop both tensors to the shorter length so shapes match."""
+    L = min(pred.size(-1), target.size(-1))
+    return pred[..., :L], target[..., :L]
 
-    # Torch does the window multiplication internally.
+
+def _stft(
+    x: Tensor,
+    n_fft:       int  = N_FFT,
+    hop_length:  Optional[int] = HOP,
+    win_length:  Optional[int] = N_FFT,
+    window:      Optional[Tensor] = None,
+    center: bool = True,
+    pad_mode: str = "constant"
+) -> Tensor:
+    """
+    Torch wrapper that mirrors **librosa.stft** defaults:
+      • Hann window (`np.hanning`) of length *win_length* (default = n_fft)
+      • hop_length = n_fft // 4 if omitted
+      • center = True  (pads ⌊n_fft/2⌋ samples at start/end)
+      • pad_mode = "reflect"
+      • output shape:  (..., n_fft//2 + 1, n_frames) — freq × time
+    """
+    if window is None:
+        window = torch.hann_window(win_length, periodic=False, dtype=x.dtype, device=x.device)
+
     return torch.stft(
-        x, n_fft=n_fft, hop_length=hop, win_length=win_length,
-        window=window, return_complex=True,
-        center=False,          # ← match reference code
+        x,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window=window,
+        center=center,
+        pad_mode=pad_mode,
         normalized=False,
-        onesided=True
+        onesided=True,
+        return_complex=True
     )
 
 
-def _istft(Z: Tensor,
-           n_fft: int = N_FFT,
-           hop:   int = HOP,
-           win_length: int | None = None,
-           window: Tensor | None = None,
-           length: int | None = None) -> Tensor:
-    
-    if win_length is None:
-        win_length = n_fft
+def _istft(
+    Z: Tensor,
+    n_fft:       int  = N_FFT,
+    hop_length:  Optional[int] = HOP,
+    win_length:  Optional[int] = N_FFT,
+    window:      Optional[Tensor] = None,
+    center: bool = True,
+    length: Optional[int] = None
+) -> Tensor:
+    """
+    Torch wrapper that mirrors **librosa.istft** defaults:
+      • Uses the same Hann window as analysis
+      • hop_length = n_fft // 4 if omitted
+      • center = True  (assumes padding was added in `_stft`)
+      • `length` can be provided to force an exact number of output samples,
+        otherwise Torch computes the natural inverse length.
+    """
     if window is None:
-        window = torch.hann_window(win_length, device=Z.device, dtype=Z.dtype)
-
+        window = torch.hann_window(win_length, periodic=False, dtype=Z.dtype, device=Z.device)
+        
     if length is None:
-        #   T  = # time slices  (last dim)
-        length = hop * Z.shape[-1] + n_fft
-
+        n_frames = Z.shape[-1]
+        length = hop_length * (n_frames - 1)
+        
+        
     return torch.istft(
-        Z, n_fft=n_fft, hop_length=hop, win_length=win_length,
-        window=window, center=False, normalized=False,
-        onesided=True, length=length
+        Z,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=win_length,
+        window=window,
+        center=center,
+        normalized=False,
+        onesided=True,
+        length=length
     )
-
 
 # -------------------------------------------------------------------------
 # Projection operators
 # -------------------------------------------------------------------------
 def proj_C1(z: Tensor, n_fft: int = N_FFT, hop: int = HOP,
-            win_length: int | None = None, window: Tensor | None = None) -> Tensor:
+            win_length: int | None = None, window: Tensor | None = None,
+            length: Optional[int] = None) -> Tensor:
     """Projection onto the set of **consistent** spectra (C₁)."""
     return _stft(_istft(z, n_fft, hop, win_length, window), n_fft, hop, win_length, window)
 
@@ -130,7 +165,8 @@ class AGLALayer(nn.Module):
         self,
         c_prev: Tensor, t_prev: Tensor, d_prev: Tensor,
         target_mag: Tensor,
-        *, n_fft: int, hop: int, win_length: int, window: Tensor
+        *, n_fft: int, hop: int, win_length: int, window: Tensor,
+        length: Optional[int] = None
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Parameters
@@ -146,7 +182,7 @@ class AGLALayer(nn.Module):
         """
         alpha, beta, gamma = self._constrained_params()
 
-        y = proj_C1(proj_C2(c_prev, target_mag), n_fft, hop, win_length, window)
+        y = proj_C1(proj_C2(c_prev, target_mag), n_fft, hop, win_length, window, length=length)
         t = (1 - gamma) * d_prev + gamma * y
         c = t + alpha * (t - t_prev)
         d = t +  beta  * (t - t_prev)
@@ -181,7 +217,7 @@ class DeepAGLA(pl.LightningModule):
         self.hop        = int(hop)
         self.win_length = self.n_fft if win_length is None else int(win_length)
         self.register_buffer("window",
-                             torch.hann_window(self.win_length),
+                             torch.hann_window(self.win_length, periodic=False),
                              persistent=False)
 
         # Learnable iteration stack ---------------------------------------
@@ -231,11 +267,12 @@ class DeepAGLA(pl.LightningModule):
             c, t, d = layer(
                 c, t, d, mag,
                 n_fft=self.n_fft, hop=self.hop,
-                win_length=self.win_length, window=self.window
+                win_length=self.win_length, window=self.window,
+                length=length
             )
 
         audio = _istft(c, self.n_fft, self.hop, self.win_length,
-                       self.window, length=length)
+                       self.window)
         return audio.clamp(-1.0, 1.0)
 
     # ---------------------------------------------------------------------
@@ -244,6 +281,8 @@ class DeepAGLA(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         mag, target_audio = batch                     # (B, F, T), (B, N)
         pred_audio = self(mag, length=target_audio.size(-1))
+        pred_audio, target_audio = _align(pred_audio, target_audio)
+
         loss = self.criterion(pred_audio, target_audio)
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
         return loss
@@ -251,7 +290,7 @@ class DeepAGLA(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         mag, target_audio = batch
         pred_audio = self(mag, length=target_audio.size(-1))
-
+        pred_audio, target_audio = _align(pred_audio, target_audio)
         # ------ metrics & loss -------------------------------------------
         metrics = evaluate_batch(pred_audio, target_audio, fs=SAMPLE_RATE)
         loss    = self.criterion(pred_audio, target_audio)
@@ -284,7 +323,7 @@ class DeepAGLA(pl.LightningModule):
     def test_step(self, batch, batch_idx):
         mag, target_audio = batch
         pred_audio = self(mag, length=target_audio.size(-1))
-
+        pred_audio, target_audio = _align(pred_audio, target_audio)
         metrics = evaluate_batch(pred_audio, target_audio, fs=SAMPLE_RATE)
         loss    = self.criterion(pred_audio, target_audio)
 

@@ -60,7 +60,6 @@ def griffin_lim_naive(magnitude_spectrogram, fft_size, hopsamp, iterations):
         The reconstructed time domain signal as a 1-dim Numpy array.
     """
     time_slices = magnitude_spectrogram.shape[0]
-    print("Time slices: ", time_slices)
     len_samples = int(time_slices*hopsamp + fft_size)
 
     # Initialize the reconstructed signal to noise.
@@ -75,7 +74,6 @@ def griffin_lim_naive(magnitude_spectrogram, fft_size, hopsamp, iterations):
         proposal_spectrogram = magnitude_spectrogram*np.exp(1.0j*reconstruction_angle)
         prev_x = x_reconstruct
         x_reconstruct = istft_for_reconstruction(proposal_spectrogram, fft_size, hopsamp)
-        print("Iteration: ", iterations - n, " of ", iterations)
     return x_reconstruct
 
 def fast_griffin_lim_librosa(

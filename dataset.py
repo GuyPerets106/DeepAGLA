@@ -7,17 +7,36 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 
-class MelAudioDataset(Dataset):
-    def __init__(self, data_dir: str | Path):
-        data_dir = Path(data_dir)
-        self.mel: np.ndarray = np.load(f'{data_dir}/mel.npy', mmap_mode="r")  # (N, N_MELS, T)
-        self.audio: np.ndarray = np.load(f'{data_dir}/audio.npy', mmap_mode="r")  # (N, FIXED_LEN)
-        assert self.mel.shape[0] == self.audio.shape[0], "Number of samples in mel and audio must match"
+class MagAudioDataset(Dataset):
+    """
+    Dataset of paired items:
+        • `mag`  : |STFT| magnitude  — shape (F, T)  float32
+        • `audio`: waveform segment — shape (N,)   float32
+    The data are stored in two `.npy` files created by the
+    preprocessing script:
 
+        data_dir/
+            ├── mag.npy   : (num_items, F, T)
+            └── audio.npy : (num_items, fixed_len)
+
+    Memory-mapped loading keeps RAM usage low even for large sets.
+    """
+    def __init__(self, data_dir: str | Path) -> None:
+        data_dir = Path(data_dir)
+        self.mag:   np.ndarray = np.load(data_dir / "mag_gold.npy",   mmap_mode="r")
+        self.audio: np.ndarray = np.load(data_dir / "audio_gold.npy", mmap_mode="r")
+
+        if self.mag.shape[0] != self.audio.shape[0]:
+            raise ValueError(
+                f"#items mismatch: mag={self.mag.shape[0]}  "
+                f"audio={self.audio.shape[0]}"
+            )
+
+    # ---- PyTorch Dataset interface -------------------------------------
     def __len__(self) -> int:
-        return self.mel.shape[0]
+        return self.mag.shape[0]
 
     def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor]:
-        mel = torch.tensor(self.mel[idx], dtype=torch.float32)
-        wav = torch.tensor(self.audio[idx], dtype=torch.float32)
-        return mel, wav
+        mag   = torch.as_tensor(self.mag[idx],   dtype=torch.float32)  # (F, T)
+        audio = torch.as_tensor(self.audio[idx], dtype=torch.float32)  # (N,)
+        return mag.T, audio
