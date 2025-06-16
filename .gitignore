@@ -16,3 +16,4 @@ wheels/
 .venv
 *.wav
 *.csv
+.DS_Store

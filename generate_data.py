@@ -9,8 +9,8 @@ import librosa
 import numpy as np
 import soundfile as sf
 from tqdm import tqdm
-
-from definitions import SAMPLE_RATE, N_FFT, HOP, N_MELS, FMIN, FMAX
+import audio_utilities
+from definitions import SAMPLE_RATE, N_FFT, HOP, N_MELS, FMIN, FMAX, N_LIN
 
 SLR_URL_GOLD = "https://openslr.org/resources/134/saspeech_gold_standard_v1.0.tar.gz"
 SLR_URL_AUTO = "https://openslr.org/resources/134/saspeech_automatic_data_v1.0.tar.gz"
@@ -107,21 +107,14 @@ def main() -> None:
     print(f"• Median length = {med_len / SAMPLE_RATE:.2f} s  ({med_len} samples)")
 
     N          = len(wav_paths)
-    mel_frames = med_len // HOP + 1
-    audio_buf  = np.empty((N, med_len), dtype=np.float32)
-    mel_buf    = np.empty((N, N_MELS, mel_frames), dtype=np.float32)
+    T = 1 + (med_len - N_FFT) // HOP
 
-    mel_fb = librosa.filters.mel(sr=SAMPLE_RATE,
-                                 n_fft=N_FFT,
-                                 n_mels=N_MELS,
-                                 fmin=FMIN,
-                                 fmax=FMAX,
-                                 htk=False,
-                                 norm=None)
+    audio_buf  = np.empty((N, med_len), dtype=np.float32)
+    mag_buf = np.empty((N, T, N_LIN), dtype=np.float32)
 
     print("▸ Processing …")
     for i, p in enumerate(tqdm(wav_paths, unit="file")):
-        wav, sr = sf.read(p, dtype="float32")
+        wav, sr = sf.read(p)
         if wav.ndim == 2:
             wav = wav.mean(axis=1)
         if sr != SAMPLE_RATE:
@@ -130,32 +123,23 @@ def main() -> None:
         wav = force_length(wav / max(np.abs(wav).max(), 1e-8), med_len)
         audio_buf[i] = wav
 
-        mag2 = np.abs(librosa.stft(wav, n_fft=N_FFT, hop_length=HOP, win_length=N_FFT, window="hann")) ** 2
-        mel_power = mel_fb @ mag2
-        mel_mag = mel_fb @ np.sqrt(mag2)
-        cur = mel_mag.shape[1]
-        mel_buf[i] = np.pad(mel_mag, ((0, 0), (0, mel_frames - cur))) if cur < mel_frames else mel_mag[:, :mel_frames]
+        stft = audio_utilities.stft_for_reconstruction(wav, N_FFT, HOP)
+        power_spec = np.abs(stft)**2.0
+        scale = 1.0 / np.amax(power_spec)
+        power_spec *= scale
+        mag_modified = power_spec/scale
+        mag_modified = mag_modified**0.5 # abs(STFT)
+        mag_buf[i] = mag_modified
+        
+    example_audio = audio_buf[0]
+    example_mel = mag_buf[0]
+    print(f"Data Example Shaes:")
+    print(f"Audio Shape: {example_audio.shape}")
+    print(f"Magnitude Spectrogram Shape: {example_mel.shape}")
 
-    print("▸ Sanity check …")
-    pinv = np.linalg.pinv(mel_fb)
-    mel0 = mel_buf[0]
-    mag_hat2 = pinv @ mel0
-    mel_hat = mel_fb @ mag_hat2
-    l2_rel = np.mean((mel0 - mel_hat) ** 2) / np.mean(mel0 ** 2)
-    print(f"   Mel round-trip L2rel: {l2_rel:.2e}")
-    assert l2_rel < 1e-2
-
-    wav0 = audio_buf[0]
-    recon = librosa.istft(librosa.stft(wav0, n_fft=N_FFT, hop_length=HOP, win_length=N_FFT, window="hann"),
-                          hop_length=HOP, win_length=N_FFT, window="hann", length=len(wav0))
-    pcm_err = np.mean(np.abs(wav0 - recon))
-    print(f"   STFT/iSTFT L1 error: {pcm_err:.2e}")
-    assert pcm_err < 1e-5
-
-    print("✔  Sanity checks passed")
     args.data_dir.mkdir(parents=True, exist_ok=True)
-    np.save(args.data_dir / "audio.npy", audio_buf)
-    np.save(args.data_dir / "mel_mag.npy", mel_buf)
+    np.save(args.data_dir / f"audio_{args.download}.npy", audio_buf)
+    np.save(args.data_dir / f"mag_{args.download}.npy", mag_buf)
     print("✔  Saved arrays in", args.data_dir)
 
 if __name__ == "__main__":
