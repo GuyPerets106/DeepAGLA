@@ -17,3 +17,4 @@ wheels/
 *.wav
 *.csv
 .DS_Store
+*.json
