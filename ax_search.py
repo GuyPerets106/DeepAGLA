@@ -13,7 +13,7 @@ except RuntimeError:
     pass  # Already set
 
 from ax.service.managed_loop import optimize
-from train_new import main as train_once
+from train import main as train_once
 
 # ---------------------------------------------------------------------------
 # 1. Search space definition
