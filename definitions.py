@@ -1,21 +1,24 @@
-import torch
-
+import numpy as np
+import os
 BEST_INITIAL_COMBINATIONS = { # Per the paper, page 8
     "convergence": {"alpha": 0.09, "beta": 1.10, "gamma": 0.2},
     "overall": {"alpha": 1.05, "beta": 1.35, "gamma": 1.25}
 }
+PROJECT_NAME = "deep-agla-optim"
+DATA_PATH = "/gpfs0/bgu-benshimo/users/guyperet/DeepAGLA/data/audio_gold_auto.npy"
+if os.path.exists(DATA_PATH):
+    EXAMPLE_AUDIO = np.load(DATA_PATH)[0]  # Load a single example for testing
 
-SAMPLE_RATE = 44100
-N_FFT = 2048
-HOP = N_FFT // 8
-N_LIN = 1 + N_FFT // 2
+SAMPLE_RATE = 22050 # Half of 44.1 kHz, as loaded by librosa
+N_FFT = 512
+HOP = N_FFT // 4
+WIN_LEN = N_FFT
 
-TRAIN_RATIO = 0.85
-VAL_RATIO = 0.1
-
-N_LAYERS = 8
-LEARNING_RATE = 2e-3
-WEIGHT_DECAY = 1e-6
-BATCH_SIZE = 8
-NUM_WORKERS = 8
-NUM_EPOCHS = 100
+VAL_SPLIT = 0.05
+TEST_SPLIT = 0.05
+N_LAYERS = 100
+LEARNING_RATE = 5e-2
+WEIGHT_DECAY = 1e-3
+BATCH_SIZE = 2
+NUM_WORKERS = 2
+NUM_EPOCHS = 30

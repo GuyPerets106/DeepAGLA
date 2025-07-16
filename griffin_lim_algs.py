@@ -1,313 +1,381 @@
-import numpy as np
 import librosa
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy.signal
+import soundfile as sf
 
-def stft_for_reconstruction(x, fft_size, hopsamp):
-    """Compute and return the STFT of the supplied time domain signal x.
+EXAMPLE_AUDIO = "/Users/guyperets/Documents/DeepAGLA/data/saspeech_gold_standard/wavs/gold_000_line_000.wav"
+OUT_DIR = "/Users/guyperets/Downloads/MetricsCheck_GL_Algs"
+N_FFT = 512
+HOP = N_FFT // 4
+WIN_LEN = N_FFT
+EPS = 1e-12 # Small constant to avoid division by zero
 
-    Args:
-        x (1-dim Numpy array): A time domain signal.
-        fft_size (int): FFT size. Should be a power of 2, otherwise DFT will be used.
-        hopsamp (int):
-
-    Returns:
-        The STFT. The rows are the time slices and columns are the frequency bins.
+# HELPER FUNCTIONS
+def preprocess_loaded_audio(
+    x: np.ndarray,
+    sr: int,
+    target_rms: float = 0.15,
+    hp_cutoff: float = 30.0,
+    n_fft: int = N_FFT,
+    hop_length: int = HOP
+) -> tuple[np.ndarray, dict[str, int | str | bool]]:
     """
-    window = np.hanning(fft_size)
-    fft_size = int(fft_size)
-    hopsamp = int(hopsamp)
-    return np.array([np.fft.rfft(window*x[i:i+fft_size])
-                     for i in range(0, len(x)-fft_size, hopsamp)])
-
-def istft_for_reconstruction(X, fft_size, hopsamp):
-    """Invert a STFT into a time domain signal.
-
-    Args:
-        X (2-dim Numpy array): Input spectrogram. The rows are the time slices and columns are the frequency bins.
-        fft_size (int):
-        hopsamp (int): The hop size, in samples.
-
-    Returns:
-        The inverse STFT.
+    Pre‑process a time‑domain signal for Griffin‑Lim (or FGLA).
     """
-    fft_size = int(fft_size)
-    hopsamp = int(hopsamp)
-    window = np.hanning(fft_size)
-    time_slices = X.shape[0]
-    len_samples = int(time_slices*hopsamp + fft_size)
-    x = np.zeros(len_samples)
-    for n,i in enumerate(range(0, len(x)-fft_size, hopsamp)):
-        x[i:i+fft_size] += window*np.real(np.fft.irfft(X[n]))
+    # 1) High‑pass filter (2nd‑order Butterworth)
+    if hp_cutoff is not None and hp_cutoff > 0:
+        b, a = scipy.signal.butter(2, hp_cutoff, "hp", fs=sr)
+        x = scipy.signal.lfilter(b, a, x)
+
+    # 2) RMS normalisation
+    if target_rms is not None and target_rms > 0:
+        rms = np.sqrt(np.mean(x**2)) + 1e-12  # avoid /0 on silence
+        x = x * (target_rms / rms)
+
+    # 3) Pad to a multiple of hop_length
+    hop_length = hop_length or (n_fft // 4)
+    pad = (-len(x)) % hop_length
+    if pad:
+        x = np.pad(x, (0, pad))
+
+    # 4) Cast to float32
+    x = x.astype(np.float32, copy=False)
     return x
 
+def stft(signal, n_fft=N_FFT, hop_length=HOP, win_length=WIN_LEN):
+    """Compute the Short-Time Fourier Transform (STFT) of a signal."""
+    return librosa.stft(signal, n_fft=n_fft, hop_length=hop_length, win_length=win_length, window='hann')
 
-def griffin_lim_naive(magnitude_spectrogram, fft_size, hopsamp, iterations):
-    """Reconstruct an audio signal from a magnitude spectrogram.
+def istft(spectrum, hop_length=HOP, win_length=WIN_LEN):
+    """Compute the Inverse Short-Time Fourier Transform (ISTFT) of a spectrum."""
+    return librosa.istft(spectrum, hop_length=hop_length, win_length=win_length, window='hann')
 
-    Given a magnitude spectrogram as input, reconstruct
-    the audio signal and return it using the Griffin-Lim algorithm from the paper:
-    "Signal estimation from modified short-time fourier transform" by Griffin and Lim,
-    in IEEE transactions on Acoustics, Speech, and Signal Processing. Vol ASSP-32, No. 2, April 1984.
-
-    Args:
-        magnitude_spectrogram (2-dim Numpy array): The magnitude spectrogram. The rows correspond to the time slices
-            and the columns correspond to frequency bins.
-        fft_size (int): The FFT size, which should be a power of 2.
-        hopsamp (int): The hope size in samples.
-        iterations (int): Number of iterations for the Griffin-Lim algorithm. Typically a few hundred
-            is sufficient.
-
-    Returns:
-        The reconstructed time domain signal as a 1-dim Numpy array.
+def proj_pc1(c):
     """
-    time_slices = magnitude_spectrogram.shape[0]
-    len_samples = int(time_slices*hopsamp + fft_size)
-
-    # Initialize the reconstructed signal to noise.
-    x_reconstruct = np.random.randn(len_samples)
-    n = iterations # number of iterations of Griffin-Lim algorithm.
-    while n > 0:
-        n -= 1
-        reconstruction_spectrogram = stft_for_reconstruction(x_reconstruct, fft_size, hopsamp)
-        reconstruction_angle = np.angle(reconstruction_spectrogram)
-
-        # Discard magnitude part of the reconstruction and use the supplied magnitude spectrogram instead.
-        proposal_spectrogram = magnitude_spectrogram*np.exp(1.0j*reconstruction_angle)
-        prev_x = x_reconstruct
-        x_reconstruct = istft_for_reconstruction(proposal_spectrogram, fft_size, hopsamp)
-    return x_reconstruct
-
-def fast_griffin_lim_librosa(
-    magnitude_spectrogram,
-    n_iter=60,
-    hop_length=512,
-    win_length=2048,
-    window='hann',
-    momentum=0.99,
-    init='random',
-    length=None
-):
+    Use the AGLA paper definition of PC1 which is stft(istft(spectrum=c))
     """
-    Reconstruct a time-domain signal from a magnitude spectrogram
-    using the Fast Griffin-Lim Algorithm (FGLA) as implemented in librosa.
+    return stft(istft(c))
 
-    Parameters
-    ----------
-    magnitude_spectrogram : np.ndarray [shape=(n_fft/2+1, t)]
-        Magnitude spectrogram (typically obtained from STFT)
-
-    n_iter : int
-        Number of iterations
-
-    hop_length : int or None
-        Number of audio samples between adjacent STFT columns
-
-    win_length : int or None
-        Each frame of audio is windowed by `window()` of length `win_length`
-
-    window : str
-        Window function used in STFT and ISTFT
-
-    momentum : float [0.0–1.0]
-        Momentum parameter; use 0.99 for Fast Griffin-Lim, 0.0 for classic GLA
-
-    init : str ['random', 'zeros']
-        Phase initialization method
-
-    length : int or None
-        If provided, sets the output signal length (in samples)
-
-    Returns
-    -------
-    y : np.ndarray
-        Time-domain signal reconstructed from magnitude_spectrogram
+def proj_pc2_old(c, s):
     """
-    return librosa.griffinlim(
-        S=magnitude_spectrogram,
-        n_iter=n_iter,
-        hop_length=hop_length,
-        win_length=win_length,
-        window=window,
-        momentum=momentum,
-        init=init,
-        length=length
-    )
-def accelerated_griffin_lim(
-    S_mag,
-    n_iter=60,
-    alpha=0.2,
-    beta=0.8,
-    gamma=0.99,
-    hop_length=None,
-    win_length=None,
-    window="hann",
-    init="random",
-    length=None,
-    random_state=None,
-):
+    Use the AGLA paper definition of PC2 which is (spectrum=c)*(orig_mag_spec=s)/(np.abs(spectrum=c)) if spectrum=c != 0 else orig_mag_spec=s
     """
-    Implements Algorithm 3: Accelerated Griffin-Lim from Perraudin et al. (2013).
+    res = np.zeros_like(c, dtype=np.complex64)
+    for i in range(c.shape[0]):
+        for j in range(c.shape[1]):
+            if c[i, j] != 0:
+                res[i, j] = c[i, j] * s[i, j] / np.abs(c[i, j])
+            else:
+                res[i, j] = s[i, j]
+    return res
 
-    Parameters
-    ----------
-    S_mag : np.ndarray
-        Magnitude spectrogram (|STFT(x)|)
-    n_iter : int
-        Number of iterations
-    alpha, beta, gamma : float
-        Acceleration parameters (α, β, γ > 0)
-    hop_length : int
-        Hop length for STFT
-    win_length : int
-        Window length for STFT
-    window : str
-        Window type for STFT/ISTFT
-    init : str
-        'random' or 'zeros'
-    length : int or None
-        Target length of the reconstructed signal
-    random_state : int or None
-        For reproducibility if init='random'
-
-    Returns
-    -------
-    y : np.ndarray
-        Time-domain reconstructed signal
+def proj_pc2(c, s):
     """
-
-    rng = np.random.default_rng(random_state)
-
-    # Step 1: Initialize c0, t0, d0
-    if init == "random":
-        phase = np.exp(2j * np.pi * rng.random(S_mag.shape))
-    elif init == "zeros":
-        phase = np.ones_like(S_mag, dtype=np.complex64)
-    else:
-        raise ValueError("init must be 'random' or 'zeros'")
-
-    c = S_mag * phase
-    t = c.copy()
-    d = c.copy()
-
-    for n in range(n_iter):
-        # t_n = (1 - γ) * d_{n-1} + γ * PC1(PC2(c_{n-1}))
-        # PC2: project to magnitude (replace magnitude)
-        # PC1: project to consistent spectrogram (via STFT of ISTFT)
-        x_temp = librosa.istft(c, hop_length=hop_length, win_length=win_length, window=window, length=length)
-        c_temp = librosa.stft(x_temp, hop_length=hop_length, win_length=win_length, window=window)
-
-        phase_proj = c_temp / np.maximum(1e-8, np.abs(c_temp))
-        c_proj = S_mag * phase_proj  # PC2 projection
-        x_consistent = librosa.istft(c_proj, hop_length=hop_length, win_length=win_length, window=window, length=length)
-        c_consistent = librosa.stft(x_consistent, hop_length=hop_length, win_length=win_length, window=window)
-
-        t_new = (1 - gamma) * d + gamma * c_consistent
-
-        # c_n = t_n + α (t_n - t_{n-1})
-        c_new = t_new + alpha * (t_new - t)
-
-        # d_n = t_n + β (t_n - t_{n-1})
-        d_new = t_new + beta * (t_new - t)
-
-        # Shift variables
-        t = t_new
-        c = c_new
-        d = d_new
-
-    # Final inverse transform: T†(c_N)
-    y = librosa.istft(c, hop_length=hop_length, win_length=win_length, window=window, length=length)
-    return y
-
-def accelerated_griffin_lim_from_mel(
-    M,
-    *,
-    sr: int,
-    n_fft: int,
-    hop_length: int | None = None,
-    win_length: int | None = None,
-    fmin: float = 0.0,
-    fmax: float | None = None,
-    power: float = 1.0,          # 1.0 → magnitude-mel, 2.0 → power-mel
-    n_iter: int = 60,
-    alpha: float = 0.2,
-    beta: float = 0.8,
-    gamma: float = 0.99,
-    init: str = "random",
-    length: int | None = None,
-    random_state: int | None = None,
-):
+    Use the AGLA paper definition of PC2 which is (spectrum=c)*(orig_mag_spec=s)/(np.abs(spectrum=c)) if spectrum=c != 0 else orig_mag_spec=s
     """
-    Reconstructs a time-domain signal from a **mel spectrogram** using the
-    Accelerated Griffin-Lim algorithm (Perraudin et al., 2013).
+    return s * np.exp(1j * np.angle(c))
 
-    Parameters
-    ----------
-    M : np.ndarray [shape=(n_mels, n_frames)]
-        Mel-spectrogram (magnitude or power, controlled by ``power``).
-    sr, n_fft, hop_length, win_length : int
-        STFT parameters (must match those used to create ``M``).
-    fmin, fmax : float
-        Lower / upper frequency limits of the mel filter bank.
-    power : {1.0, 2.0}
-        If 1.0 ``M`` is magnitude-mel, if 2.0 ``M`` is power-mel.
-    n_iter, alpha, beta, gamma, init, length, random_state
-        See ``accelerated_griffin_lim`` documentation.
+# METRIC FUNCTIONS (Pass original and estimated time domain signals)
+def match_length(original, estimated):
+    """Match the length of the original and estimated signals."""
+    min_length = min(len(original), len(estimated))
+    return original[:min_length], estimated[:min_length]
 
-    Returns
-    -------
-    y : np.ndarray
-        Reconstructed time-domain signal.
+def match_dtype(original, estimated):
+    """Match the data type of the original and estimated signals, using np.float64."""
+    original = np.asarray(original, dtype=np.float32)
+    estimated = np.asarray(estimated, dtype=np.float32)
+    return original, estimated
+
+def align_signals(original, estimated):
+    lag = np.argmax(np.correlate(estimated, original, mode='full')) - len(original) + 1
+    estimated_aligned = np.roll(estimated, -lag)
+    return original, estimated_aligned
+
+def match_signals(original, estimated):
+    """Match the original and estimated signals by aligning them."""
+    original, estimated = align_signals(original, estimated)
+    original, estimated = match_length(original, estimated)
+    original, estimated = match_dtype(original, estimated)
+    return original, estimated
+
+
+def compute_ssnr_db(original, estimated):
+    """Compute the Spectral Signal-to-Noise Ratio (SSNR) between original and estimated signals."""
+    original_stft = stft(original)
+    estimated_stft = stft(estimated)
+    noise = np.abs(original_stft - estimated_stft)
+    ssnr = 10 * np.log10(np.sum(np.abs(original_stft)**2) / (np.sum(noise**2) + EPS))
+    return ssnr
+
+def compute_psnr_db(original, estimated):
+    """Compute the Peak Signal-to-Noise Ratio (PSNR) between original and estimated signals."""
+    mse = np.mean((original - estimated)**2)
+    if mse == 0:
+        return float('inf')  # No noise
+    max_pixel = np.max(np.abs(original))
+    psnr = 20 * np.log10(max_pixel / np.sqrt(mse))
+    return psnr
+
+def compute_mse(original, estimated):
+    """Compute the Mean Squared Error (MSE) between original and estimated signals."""
+    return np.mean((original - estimated)**2)
+
+def compute_mae(original, estimated):
+    """Compute the Mean Absolute Error (MAE) between original and estimated signals."""
+    return np.mean(np.abs(original - estimated))
+
+def compute_ser_db(original, estimated):
+    """Compute the Signal-to-Error Ratio (SER) in the STFT domain."""
+    X = stft(original)
+    Y = stft(estimated)
+    signal_energy = np.sum(np.abs(X) ** 2)
+    error_energy  = np.sum(np.abs(X - Y) ** 2) + EPS
+
+    ser = 10.0 * np.log10(signal_energy / error_energy)
+    return ser
+
+
+def compute_snr_db(original, estimated):
+    """Compute the (non-scale-invariant) Signal-to-Noise Ratio (SNR)."""
+    noise = original - estimated
+    snr = 10.0 * np.log10(np.sum(original ** 2) / (np.sum(noise ** 2) + EPS))
+    return snr
+
+def compute_sisdr_db(original, estimated):
+    """Compute the Scale-Invariant Signal-to-Distortion Ratio (SI-SDR) between."""
+    x = original- np.mean(original)
+    y = estimated - np.mean(estimated)
+
+    scale = np.dot(x, y) / (np.dot(y, y) + EPS)
+    y_scaled = scale * y
+
+    sisdr = 10.0 * np.log10(np.sum(x ** 2) / (np.sum((x - y_scaled) ** 2) + EPS))
+    return sisdr
+
+
+def compute_sisnr_db(original, estimated):
+    """Compute the Scale-Invariant Signal-to-Noise Ratio (SI-SNR) between."""
+    x = original.astype(np.float64) - np.mean(original)
+    y = estimated.astype(np.float64) - np.mean(estimated)
+
+    scale = np.dot(x, y) / (np.dot(x, x) + EPS)
+    x_scaled = scale * x
+
+    sisnr = 10.0 * np.log10(np.sum(x_scaled ** 2) / (np.sum((y - x_scaled) ** 2) + EPS))
+    return sisnr
+
+def compute_stoi(original, estimated, sr=22050):
+    """Compute the Short-Time Objective Intelligibility (STOI) score."""
+    try:
+        from pystoi import stoi
+    except ImportError as e:
+        raise ImportError("Please `pip install pystoi` to use compute_stoi") from e
+
+    return stoi(original, estimated, sr)
+
+
+def compute_lsd_db(original, estimated):
+    """Compute the Log-Spectral Distance (LSD) in dB."""
+    S_ref = np.abs(stft(original)) + EPS
+    S_est = np.abs(stft(estimated)) + EPS
+
+    log_diff = 10.0 * np.log10(S_ref) - 10.0 * np.log10(S_est)
+    return np.mean(np.abs(log_diff))
+
+
+def compute_spectral_convergence(original, estimated):
+    """Compute spectral convergence = ‖|S_est| - |S_ref|‖₂ / ‖S_ref‖₂."""
+    S_ref = np.abs(stft(original))
+    S_est = np.abs(stft(estimated))
+    return np.linalg.norm(S_est - S_ref) / (np.linalg.norm(S_ref) + EPS)
+
+
+def compute_all_metrics(original, estimated):
+    """Compute all metrics between original and estimated signals."""
+    return {
+        'SNR (dB)': compute_snr_db(original, estimated),
+        'SSNR (dB)': compute_ssnr_db(original, estimated),
+        'PSNR (dB)': compute_psnr_db(original, estimated),
+        'MSE': compute_mse(original, estimated),
+        'MAE': compute_mae(original, estimated),
+        'SER (dB)': compute_ser_db(original, estimated),
+        'SISDR (dB)': compute_sisdr_db(original, estimated),
+        'SISNR (dB)': compute_sisnr_db(original, estimated),
+        'STOI': compute_stoi(original, estimated),
+        'LSD (dB)': compute_lsd_db(original, estimated),
+        'Spectral Convergence': compute_spectral_convergence(original, estimated)
+    }
+    
+def init_metrics_dict():
+    return {
+        'SNR (dB)': [],
+        'SSNR (dB)': [],
+        'PSNR (dB)': [],
+        'MSE': [],
+        'MAE': [],
+        'SER (dB)': [],
+        'SISDR (dB)': [],
+        'SISNR (dB)': [],
+        'STOI': [],
+        'LSD (dB)': [],
+        'Spectral Convergence': []
+    }
+    
+# GL Algorithms
+
+def naive_griffin_lim(sig, n_iter=64):
     """
+    Naive Griffin-Lim algorithm as described in AGLA paper.
+    Reconstructs a signal from its magnitude spectrogram.
+    Calculates metrics at each iterarion.
+    Returns the reconstructed signal and a list of metrics.
+    """
+    s = np.abs(stft(sig)) # Constant throughout the iterations
+    c = s.astype(np.complex64)  # Initialize with the magnitude spectrogram as complex numbers, no phase information
+    metrics = init_metrics_dict()
+    for n in range(1, n_iter + 1):
+        c = proj_pc1(proj_pc2(c, s))
+        if n > 2: # Start measure metrics
+            curr_est = istft(c)
+            # Calculate metrics
+            matched_length_sig, matched_length_est = match_signals(sig, curr_est)
+            curr_metrics = compute_all_metrics(matched_length_sig, matched_length_est)
+            for key, value in curr_metrics.items():
+                metrics[key].append(value)
+        
+        
+    reconstructed_signal = istft(c)
+    return reconstructed_signal, metrics
 
-    # ------------------------------------------------------------------
-    # 1) MEL → linear-frequency magnitude
-    # ------------------------------------------------------------------
-    #
-    # librosa provides a numerically robust pseudo-inverse:
-    #   librosa.feature.inverse.mel_to_stft
-    #
-    # power controls the (.)**(1/power) conversion so that
-    # power=2.0 treats M as power-mel and returns magnitude STFT.
-    #
-    S_mag = librosa.feature.inverse.mel_to_stft(
-        M,
-        sr=sr,
-        n_fft=n_fft,
-        power=power,
-        fmin=fmin,
-        fmax=fmax,
-    )
+def fast_griffin_lim(sig, n_iter=64):
+    """
+    Fast Griffin-Lim algorithm with momentum.
+    Reconstructs a signal from its magnitude spectrogram.
+    Calculates metrics at each iteration.
+    Returns the reconstructed signal and a list of metrics.
+    """
+    s = np.abs(stft(sig))  # Constant throughout the iterations
+    c0 = s.astype(np.complex64)  # Initialize with the magnitude spectrogram as complex numbers, no phase information
+    t_prev = proj_pc1(proj_pc2(c0, s))  # Initial projection
+    c = t_prev.copy()  # Initialize c with the first projection
+    metrics = init_metrics_dict()
+    
+    for n in range(1, n_iter + 1):
+        momentum = (n - 1) / (n + 2) # Like the paper suggested - momentum decreases over iterations to assure monotonic convergence
+        t = proj_pc1(proj_pc2(c, s))
+        c = t + momentum * (t - t_prev)
+        t_prev = t.copy()
+        curr_est = istft(t_prev)
+        # Calculate metrics
+        matched_length_sig, matched_length_est = match_signals(sig, curr_est)
+        curr_metrics = compute_all_metrics(matched_length_sig, matched_length_est)
+        for key, value in curr_metrics.items():
+            metrics[key].append(value)
+            
+    reconstructed_signal = istft(c)
+    return reconstructed_signal, metrics
 
-    # ------------------------------------------------------------------
-    # 2) Run accelerated Griffin-Lim on the linear spectrogram
-    # ------------------------------------------------------------------
-    rng = np.random.default_rng(random_state)
+def accelerated_griffin_lim(sig, n_iter=64, alpha=0.09, beta=1.1, gamma=1.25):
+    """
+    Accelerated Griffin-Lim algorithm with inertial extrapolation.
+    Reconstructs a signal from its magnitude spectrogram.
+    Calculates metrics at each iteration.
+    Returns the reconstructed signal and a list of metrics.
+    """
+    s = np.abs(stft(sig))  # Constant throughout the iterations
+    c0 = s.astype(np.complex64)  # Initialize with the magnitude spectrogram as complex numbers, no phase information
+    t_prev = proj_pc1(proj_pc2(c0, s))  # Initial projection
+    d_prev = t_prev.copy()  # Initialize d with the first projection
+    c = t_prev.copy()  # Initialize c with the first projection
+    metrics = init_metrics_dict()
+    
+    for n in range(1, n_iter + 1):
+        alpha = (n - 1) / (n + 2)  # Decrease alpha over iterations
+        beta = n / (n + 3)  # Decrease beta over iterations
+        t = (1 - gamma) * d_prev + gamma * proj_pc1(proj_pc2(c, s))
+        c = t + alpha * (t - t_prev)
+        d = t + beta * (t - t_prev)
+        t_prev = t.copy()
+        d_prev = d.copy()
+        curr_est = istft(t_prev)
+        # Calculate metrics
+        matched_length_sig, matched_length_est = match_signals(sig, curr_est)
+        curr_metrics = compute_all_metrics(matched_length_sig, matched_length_est)
+        for key, value in curr_metrics.items():
+            metrics[key].append(value)
+            
+    reconstructed_signal = istft(c)
+    return reconstructed_signal, metrics
+     
+def audio_stats(x, name):
+    print(f"{name:10s}  min={x.min():.2e}  max={x.max():.2e}  "
+          f"nan={np.isnan(x).any()}  inf={np.isinf(x).any()}")
+  
 
-    if init == "random":
-        phase = np.exp(2j * np.pi * rng.random(S_mag.shape))
-    elif init == "zeros":
-        phase = np.ones_like(S_mag, dtype=np.complex64)
-    else:
-        raise ValueError("init must be 'random' or 'zeros'")
+if __name__ == "__main__":
+    n_iter = 64
+    sr = 22050
+    original_signal = np.load("/gpfs0/bgu-benshimo/users/guyperet/DeepAGLA/data/preprocessed_audio_gold.npy")[0]
+    print(f"Original signal length: {len(original_signal)} samples, Sample rate: {sr} Hz")
+    
+    print("----- Baseline SNR and Librosa Griffin-Lim sanity check -----")
+    x_ref = original_signal
+    x_chk = istft(stft(original_signal))
+    x_ref, x_chk = match_signals(x_ref, x_chk)
+    print(f"STFT⇄ISTFT baseline SNR: {10*np.log10(np.sum(x_ref**2)/np.sum((x_ref-x_chk)**2))} [dB]")
+    # Try to use librosa.griffin_lim as a sanity check
+    x_librosa = librosa.griffinlim(np.abs(stft(x_ref)), n_iter=n_iter, init=None)
+    x_ref, x_librosa = match_signals(x_ref, x_librosa)
+    print(f"Librosa Griffin-Lim SNR: {10*np.log10(np.sum(x_ref**2)/np.sum((x_ref-x_librosa)**2))} [dB]")
+    
+    # original_signal = preprocess_loaded_audio(original_signal, sr)
+    # Run the naive Griffin-Lim algorithm
+    print("\nRunning Naive Griffin-Lim algorithm...")
+    reconstructed_signal_naive, metrics_naive = naive_griffin_lim(original_signal, n_iter=n_iter)
+    print(f"Reconstructed signal length: {len(reconstructed_signal_naive)} samples")
+    print(f"Metrics after {n_iter} iterations:")
+    for metric, values in metrics_naive.items():
+        print(f"{metric}: {values[-1]:.5f}")
+        
+    # Plot the metrics progress for Naive Griffin-Lim
+    # sf.write(f"{OUT_DIR}/recon_naive.wav", reconstructed_signal_naive, sr)
+    
+    print("\nRunning Fast Griffin-Lim algorithm...")
+    reconstructed_signal_fast, metrics_fast = fast_griffin_lim(original_signal, n_iter=n_iter)
+    print(f"Reconstructed signal length: {len(reconstructed_signal_fast)} samples")
+    print(f"Metrics after {n_iter} iterations:")
+    for metric, values in metrics_fast.items():
+        print(f"{metric}: {values[-1]:.5f}")
+    # Save the reconstructed signal for Fast Griffin-Lim
+    # sf.write(f"{OUT_DIR}/recon_fast.wav", reconstructed_signal_fast, sr)
+    
+    print("\nRunning Accelerated Griffin-Lim algorithm...")
+    reconstructed_signal_accel, metrics_accel = accelerated_griffin_lim(original_signal, n_iter=n_iter)
+    print(f"Reconstructed signal length: {len(reconstructed_signal_accel)} samples")
+    print(f"Metrics after {n_iter} iterations:")
+    for metric, values in metrics_accel.items():
+        print(f"{metric}: {values[-1]:.5f}")
 
-    c = S_mag * phase
-    t = c.copy()
-    d = c.copy()
-
-    for _ in range(n_iter):
-        x = librosa.istft(c, hop_length=hop_length, win_length=win_length, length=length)
-        C = librosa.stft(x, n_fft=n_fft, hop_length=hop_length, win_length=win_length)
-
-        phase_proj = C / np.maximum(1e-8, np.abs(C))
-        C_proj = S_mag * phase_proj                        # PC₂
-        x_consistent = librosa.istft(C_proj, hop_length=hop_length,
-                                     win_length=win_length, length=length)
-        C_consistent = librosa.stft(x_consistent, n_fft=n_fft,
-                                    hop_length=hop_length, win_length=win_length)
-
-        t_new = (1 - gamma) * d + gamma * C_consistent     # tₙ
-        c_new = t_new + alpha * (t_new - t)                # cₙ
-        d_new = t_new + beta * (t_new - t)                 # dₙ
-
-        t, c, d = t_new, c_new, d_new
-
-    return librosa.istft(c, hop_length=hop_length, win_length=win_length, length=length)
+    # Save the reconstructed signal for Accelerated Griffin-Lim
+    # sf.write(f"{OUT_DIR}/recon_accel.wav", reconstructed_signal_accel, sr)
+    
+    # Plot the metrics progress for all three algorithms
+    # for metric in metrics_naive.keys():
+    #     plt.figure(figsize=(12, 8))
+    #     plt.plot(metrics_naive[metric], label=f'Naive {metric}')
+    #     plt.plot(metrics_fast[metric], label=f'Fast {metric}')
+    #     plt.plot(metrics_accel[metric], label=f'Accelerated {metric}')
+    #     plt.xlabel('Iteration')
+    #     plt.ylabel(f'{metric} Value')
+    #     plt.title(f'{metric} Progress Over Iterations (All Algorithms)')
+    #     plt.legend()
+    #     plt.grid()
+    #     # plt.savefig(f"{OUT_DIR}/{metric}_progress.png")
+    #     plt.close()
+        
+    audio_stats(original_signal, "orig")
+    audio_stats(reconstructed_signal_naive, "naive")
+    audio_stats(reconstructed_signal_fast, "fast")
+    audio_stats(reconstructed_signal_accel, "accel")

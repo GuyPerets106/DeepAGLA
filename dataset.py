@@ -1,3 +1,4 @@
+
 from pathlib import Path
 from typing import Tuple
 
@@ -7,36 +8,49 @@ from torch import Tensor
 from torch.utils.data import Dataset
 
 
-class MagAudioDataset(Dataset):
+class AudioDataset(Dataset):
     """
-    Dataset of paired items:
-        • `mag`  : |STFT| magnitude  — shape (F, T)  float32
-        • `audio`: waveform segment — shape (N,)   float32
-    The data are stored in two `.npy` files created by the
-    preprocessing script:
+    Lazily-loaded 2-D NumPy memmap wrapped as a PyTorch ``Dataset``.
 
-        data_dir/
-            ├── mag.npy   : (num_items, F, T)
-            └── audio.npy : (num_items, fixed_len)
-
-    Memory-mapped loading keeps RAM usage low even for large sets.
+    Parameters
+    ----------
+    npy_path : str | Path
+        Path to the **pre-processed** ``.npy`` file (shape = ``(N, T)``).
+    dtype : np.dtype, default np.float32
+        Dtype of the waveforms *inside* the file.  The returned tensors are
+        always ``float32``.
     """
-    def __init__(self, data_dir: str | Path) -> None:
-        data_dir = Path(data_dir)
-        self.mag:   np.ndarray = np.load(data_dir / "mag_gold.npy",   mmap_mode="r")
-        self.audio: np.ndarray = np.load(data_dir / "audio_gold.npy", mmap_mode="r")
 
-        if self.mag.shape[0] != self.audio.shape[0]:
+    def __init__(self, npy_path: str | Path, dtype: np.dtype = np.float32) -> None:
+        npy_path = Path(npy_path).expanduser()
+        if not npy_path.is_file():
+            raise FileNotFoundError(npy_path)
+
+        # Memory-map the file --> no data read yet
+        self._data = np.load(npy_path, mmap_mode='r')
+        if self._data.ndim != 2:
             raise ValueError(
-                f"#items mismatch: mag={self.mag.shape[0]}  "
-                f"audio={self.audio.shape[0]}"
+                f"Expected 2-D array (N, T); got shape {self._data.shape}"
+            )
+        if self._data.dtype != dtype:
+            raise ValueError(
+                f"Dtype mismatch: file has {self._data.dtype}, expected {dtype}"
             )
 
-    # ---- PyTorch Dataset interface -------------------------------------
+    # ------------------------------------------------------------------ #
+    # Required Dataset interface                                         #
+    # ------------------------------------------------------------------ #
     def __len__(self) -> int:
-        return self.mag.shape[0]
+        return self._data.shape[0]
 
-    def __getitem__(self, idx: int) -> Tuple[Tensor, Tensor]:
-        mag   = torch.as_tensor(self.mag[idx],   dtype=torch.float32)  # (F, T)
-        audio = torch.as_tensor(self.audio[idx], dtype=torch.float32)  # (N,)
-        return mag.T, audio
+    def __getitem__(self, idx: int) -> Tuple[int, Tensor]:
+        """
+        Returns
+        -------
+        tuple
+            ``(idx, waveform)`` where ``waveform`` is ``float32`` tensor
+            of shape ``(T,)`` on the *CPU*.
+        """
+        sample: np.ndarray = self._data[idx]
+        wav = torch.tensor(sample, dtype=torch.float32)
+        return wav

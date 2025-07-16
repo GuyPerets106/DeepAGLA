@@ -9,8 +9,8 @@ import librosa
 import numpy as np
 import soundfile as sf
 from tqdm import tqdm
-import audio_utilities
-from definitions import SAMPLE_RATE, N_FFT, HOP, N_LIN
+import scipy.signal
+from definitions import SAMPLE_RATE, N_FFT, HOP
 
 SLR_URL_GOLD = "https://openslr.org/resources/134/saspeech_gold_standard_v1.0.tar.gz"
 SLR_URL_AUTO = "https://openslr.org/resources/134/saspeech_automatic_data_v1.0.tar.gz"
@@ -76,8 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--wav_dir", type=Path, metavar="DIR", help="Existing directory of .wav files")
-    g.add_argument("--download", nargs="?", const="auto", choices=("auto", "gold"), metavar="{auto,gold}",
-                   help="Download subset (defaults to 'auto')")
+    g.add_argument("--download", nargs="?", const="both", choices=("auto", "gold", "both"), metavar="{auto,gold,both}",
+                   help="Download subset (defaults to 'both' for combined dataset)")
     p.add_argument("--data_dir", type=Path, required=True, metavar="DIR", help="Where to write .npy arrays")
     return p
 
@@ -88,13 +88,35 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
-    wav_root = download_data(args.data_dir, subset=args.download) if args.download else args.wav_dir
-    if not wav_root.is_dir():
-        raise SystemExit("Provided --wav_dir is not a directory: " + str(wav_root))
+    # Handle different download options
+    if args.download:
+        if args.download == "both":
+            # Download both datasets and combine them
+            print("▸ Downloading and combining both GOLD and AUTO datasets...")
+            gold_root = download_data(args.data_dir, subset="gold")
+            auto_root = download_data(args.data_dir, subset="auto")
+            
+            # Collect WAV paths from both datasets
+            gold_paths = sorted(gold_root.rglob("*.wav"))
+            auto_paths = sorted(auto_root.rglob("*.wav"))
+            wav_paths = gold_paths + auto_paths
+            
+            print(f"▸ Found {len(gold_paths)} GOLD files and {len(auto_paths)} AUTO files")
+            print(f"▸ Total: {len(wav_paths)} WAV files")
+            
+        else:
+            # Download single dataset
+            wav_root = download_data(args.data_dir, subset=args.download)
+            wav_paths = sorted(wav_root.rglob("*.wav"))
+    else:
+        # Use existing WAV directory
+        wav_root = args.wav_dir
+        if not wav_root.is_dir():
+            raise SystemExit("Provided --wav_dir is not a directory: " + str(wav_root))
+        wav_paths = sorted(wav_root.rglob("*.wav"))
 
-    wav_paths = sorted(wav_root.rglob("*.wav"))
     if not wav_paths:
-        raise RuntimeError("No .wav files found under " + str(wav_root))
+        raise RuntimeError("No .wav files found")
 
     print("▸ Scanning durations …")
     lengths = []
@@ -106,41 +128,32 @@ def main() -> None:
     med_len = median_length(lengths)
     print(f"• Median length = {med_len / SAMPLE_RATE:.2f} s  ({med_len} samples)")
 
-    N          = len(wav_paths)
-    T = 1 + (med_len - N_FFT) // HOP
-
-    audio_buf  = np.empty((N, med_len), dtype=np.float32)
-    mag_buf = np.empty((N, T, N_LIN), dtype=np.float32)
+    N = len(wav_paths)
+    audio_buf = np.empty((N, med_len), dtype=np.float32)
 
     print("▸ Processing …")
     for i, p in enumerate(tqdm(wav_paths, unit="file")):
-        wav, sr = sf.read(p)
-        if wav.ndim == 2:
-            wav = wav.mean(axis=1)
-        if sr != SAMPLE_RATE:
-            wav = librosa.resample(wav, orig_sr=sr, target_sr=SAMPLE_RATE)
-
-        wav = force_length(wav / max(np.abs(wav).max(), 1e-8), med_len)
-        audio_buf[i] = wav
-
-        stft = audio_utilities.stft_for_reconstruction(wav, N_FFT, HOP)
-        power_spec = np.abs(stft)**2.0
-        scale = 1.0 / np.amax(power_spec)
-        power_spec *= scale
-        mag_modified = power_spec/scale
-        mag_modified = mag_modified**0.5 # abs(STFT)
-        mag_buf[i] = mag_modified
+        audio, sr = librosa.load(p)
+        audio_buf[i] = force_length(audio, med_len)
         
     example_audio = audio_buf[0]
-    example_mel = mag_buf[0]
-    print(f"Data Example Shaes:")
+    print(f"Data Example Shapes:")
     print(f"Audio Shape: {example_audio.shape}")
-    print(f"Magnitude Spectrogram Shape: {example_mel.shape}")
+    print(f"Total Dataset Shape: {audio_buf.shape}")
 
     args.data_dir.mkdir(parents=True, exist_ok=True)
-    np.save(args.data_dir / f"audio_{args.download}.npy", audio_buf)
-    np.save(args.data_dir / f"mag_{args.download}.npy", mag_buf)
-    print("✔  Saved arrays in", args.data_dir)
+    
+    # Determine output filename based on what was downloaded/processed
+    if args.download == "both":
+        output_name = "audio_gold_auto.npy"
+        print(f"✔ Combining {len(gold_paths)} GOLD + {len(auto_paths)} AUTO files")
+    elif args.download:
+        output_name = f"audio_{args.download}.npy"
+    
+    output_path = args.data_dir / output_name
+    np.save(output_path, audio_buf)
+    print(f"✔ Saved combined dataset to {output_path}")
+    print(f"✔ Final shape: {audio_buf.shape}")
 
 if __name__ == "__main__":
     main()
