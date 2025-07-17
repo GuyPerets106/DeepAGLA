@@ -1,7 +1,10 @@
-import numpy as np
 import math
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
+import numpy as np
+import pytorch_lightning as pl
+import wandb
+import scipy.signal
 from typing import Dict, Tuple
 from torch import Tensor
 from definitions import N_FFT, HOP, WIN_LEN, SAMPLE_RATE, EXAMPLE_AUDIO
@@ -19,8 +22,8 @@ _METRIC_WINDOW = torch.hann_window(WIN_LEN, dtype=torch.float32)
 def _as_tensor(x, *, device: torch.device | None = None) -> torch.Tensor:
     """Utility: convert numpy array to torch tensor on the desired device."""
     if torch.is_tensor(x):
-        return x.to(device or "cpu")
-    return torch.as_tensor(x, dtype=torch.float32, device=device or "cpu")
+        return x.to(device) if device is not None else x
+    return torch.as_tensor(x, dtype=torch.float32, device=device)
 
 def _ensure_2d(x: torch.Tensor) -> torch.Tensor:
     """(L,) -> (1, L); (B, L) left untouched."""
@@ -69,8 +72,11 @@ def align_signals_fft(ref: torch.Tensor, est: torch.Tensor) -> Tuple[torch.Tenso
 
 def prepare_signals(original: Tensor, estimated: Tensor) -> Tuple[Tensor, Tensor]:
     """Prepare signals for metric computation: align, match length, ensure same device."""
-    original = _as_tensor(original)
-    estimated = _as_tensor(estimated)
+    # Preserve device of original signal
+    target_device = original.device if torch.is_tensor(original) else None
+    
+    original = _as_tensor(original, device=target_device)
+    estimated = _as_tensor(estimated, device=target_device)
     
     # Ensure both are on the same device
     if original.device != estimated.device:
@@ -215,14 +221,14 @@ def evaluate_batch(pred_audio: Tensor, target_audio: Tensor) -> Dict[str, float]
 
 def compute_all_metrics(original, estimated) -> Dict[str, float]:
     """
-    Legacy function name for compatibility with deep_agla_new.py.
+    Legacy function name for compatibility with deep_agla.py.
     Redirects to evaluate_batch with appropriate argument order.
     """
     return evaluate_batch(estimated, original)
 
 def match_signals(original, estimated):
     """
-    Legacy function name for compatibility with deep_agla_new.py.
+    Legacy function name for compatibility with deep_agla.py.
     Aligns and matches signals for metric computation.
     """
     return prepare_signals(original, estimated)
@@ -245,36 +251,30 @@ def compute_validation_ssnr(model, val_loader, device: torch.device) -> float:
     
     with torch.no_grad():
         for batch in val_loader:
-            # Handle single tensor dataset (PreprocessedAudioDataset returns just audio)
-            if isinstance(batch, torch.Tensor):
-                target_audio = batch.to(device)
-                
-                # Generate prediction from the preprocessed signal
-                pred_audio = model(target_audio)
-                
-                # Prepare signals for metric computation
-                matched_orig, matched_pred = prepare_signals(target_audio, pred_audio)
-                
-                # Compute SSNR for this batch
-                batch_ssnr = compute_ssnr_db(matched_orig, matched_pred)
-                total_ssnr += batch_ssnr
-                num_batches += 1
-    
-    return total_ssnr / num_batches if num_batches > 0 else float('-inf')
+            batch = batch.to(device, non_blocking=True)
+            pred = model(batch)
+            
+            # Compute SSNR for this batch
+            ssnr = compute_ssnr_db(batch, pred)
+            total_ssnr += ssnr
+            num_batches += 1
+            
+    return total_ssnr / num_batches if num_batches > 0 else 0.0
 
 # -----------------------------------------------------------------------------
 #                              TESTING & VALIDATION
 # -----------------------------------------------------------------------------
 
 def test_metrics_on_example():
-    """
-    Test all metrics on the EXAMPLE_AUDIO to ensure they work correctly
-    and produce reasonable values.
-    """
-    print("Testing metrics on EXAMPLE_AUDIO...")
+    """Test metrics on example audio to verify correctness."""
+    print("Testing evaluation metrics...")
     
-    # Load example audio and convert to tensor with batch dimension
-    example_tensor = torch.from_numpy(EXAMPLE_AUDIO).float().unsqueeze(0)  # (1, N)
+    # Create test tensor from example audio
+    if EXAMPLE_AUDIO is None:
+        print("Warning: EXAMPLE_AUDIO not available, creating synthetic test signal")
+        example_tensor = torch.randn(22050) * 0.1  # 1 second of synthetic audio
+    else:
+        example_tensor = torch.from_numpy(EXAMPLE_AUDIO).float()
     
     print(f"Example audio shape: {example_tensor.shape}")
     print(f"Example audio range: [{example_tensor.min():.3f}, {example_tensor.max():.3f}]")

@@ -129,12 +129,16 @@ def main() -> None:
     print(f"• Median length = {med_len / SAMPLE_RATE:.2f} s  ({med_len} samples)")
 
     N = len(wav_paths)
-    audio_buf = np.empty((N, med_len), dtype=np.float32)
+    # audio_buf = np.empty((N, med_len), dtype=np.float32)
+    audio_buf = np.empty((N, 2*SAMPLE_RATE), dtype=np.float32)
 
     print("▸ Processing …")
     for i, p in enumerate(tqdm(wav_paths, unit="file")):
         audio, sr = librosa.load(p)
-        audio_buf[i] = force_length(audio, med_len)
+        # audio_buf[i] = force_length(audio, med_len)
+        fixed_length_audio = force_length(audio, 2*SAMPLE_RATE)  # Force to 2 seconds for consistency
+        # Normalize audio to -1.0 to 1.0 range
+        audio_buf[i] = fixed_length_audio / np.max(np.abs(fixed_length_audio))
         
     example_audio = audio_buf[0]
     print(f"Data Example Shapes:")

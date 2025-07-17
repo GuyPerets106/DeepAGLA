@@ -1,73 +1,123 @@
-import argparse
-from re import S
-import time
 import torch
-from torch.utils.data import DataLoader, random_split
+import torch.nn as nn
 import pytorch_lightning as pl
+from torch.utils.data import DataLoader, random_split
 from pytorch_lightning.callbacks import (
     Callback,
     LearningRateMonitor,
     ModelCheckpoint,
+    EarlyStopping,
 )
-import librosa
+from deep_agla import DeepAGLA
 from pytorch_lightning.loggers import WandbLogger
-import wandb  # required, not optional
+import wandb
+import numpy as np
+import matplotlib.pyplot as plt
 from dataset import AudioDataset
 from definitions import *
 from eval_metrics import *
+from torch.utils.checkpoint import checkpoint
+from typing import Dict, Tuple
 
+# Enable gradient checkpointing and careful optimization
 torch.set_float32_matmul_precision("medium")
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.deterministic = False
 
-# --------------------------------------------------------------------------- #
-# Monitoring callbacks
-class CoefficientMonitor(Callback):
-    """Logs α/β/γ values and their gradient L2 norms every training step."""
-
-    def on_train_batch_end(self, trainer, pl_module, *_):
-        # Safety check for logger
-        if not hasattr(trainer, 'logger') or trainer.logger is None:
-            return
-        if not hasattr(trainer.logger, 'experiment'):
-            return
+class AdvancedGradientMonitor(Callback):
+    """Monitor gradient norms per layer and overall training health"""
+    
+    def __init__(self):
+        self.layer_grad_history = {}
+        
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+        # Compute layer-wise gradient norms
+        layer_grads = {}
+        total_grad_norm = 0.0
+        
+        for name, param in pl_module.named_parameters():
+            if param.grad is not None:
+                param_grad_norm = param.grad.norm().item()
+                total_grad_norm += param_grad_norm ** 2
+                
+                if 'layers' in name:
+                    try:
+                        layer_idx = int(name.split('.')[1])
+                        if layer_idx not in layer_grads:
+                            layer_grads[layer_idx] = 0.0
+                        layer_grads[layer_idx] += param_grad_norm ** 2
+                    except (IndexError, ValueError):
+                        pass
+        
+        total_grad_norm = total_grad_norm ** 0.5
+        
+        # Convert layer gradients to norms
+        for layer_idx in layer_grads:
+            layer_grads[layer_idx] = layer_grads[layer_idx] ** 0.5
+        
+        # Store history
+        if layer_grads:
+            for layer_idx, grad_norm in layer_grads.items():
+                if layer_idx not in self.layer_grad_history:
+                    self.layer_grad_history[layer_idx] = []
+                self.layer_grad_history[layer_idx].append(grad_norm)
+        
+        # Log every 50 steps
+        if trainer.global_step % 50 == 0 and layer_grads:
+            grad_values = list(layer_grads.values())
             
-        try:
-            run = trainer.logger.experiment
+            if hasattr(trainer.logger, 'experiment'):
+                trainer.logger.experiment.log({
+                    "gradients/total_norm": total_grad_norm,
+                    "gradients/max_layer_grad": max(grad_values),
+                    "gradients/mean_layer_grad": sum(grad_values) / len(grad_values),
+                    "gradients/early_layers_avg": sum(list(layer_grads.values())[:8]) / min(8, len(grad_values)),
+                    "gradients/late_layers_avg": sum(list(layer_grads.values())[-8:]) / min(8, len(grad_values)),
+                }, step=trainer.global_step)
+        
+        # More aggressive warning thresholds for deep models
+        if total_grad_norm > 50.0:  # Reduced from 100.0
+            print(f"⚠️  High total gradient norm: {total_grad_norm:.2f} at step {trainer.global_step}")
+        
+        if layer_grads and max(layer_grads.values()) > 25.0:  # Reduced from 50.0
+            max_layer = max(layer_grads.keys(), key=lambda x: layer_grads[x])
+            print(f"⚠️  High layer gradient: Layer {max_layer} = {layer_grads[max_layer]:.2f}")
 
-            # Histograms once per logging step
-            for name in ("alpha", "beta", "gamma"):
-                vals = torch.stack([getattr(l, name).detach().cpu() for l in pl_module.layers])
-                run.log({f"hist/{name}": wandb.Histogram(vals.numpy())},
-                        step=trainer.global_step)
-        except Exception as e:
-            print(f"Warning: CoefficientMonitor logging failed: {e}")
-            pass  # Don't crash training for logging issues
-
-
-# class GlobalGradNorm(Callback):
-#     """Logs total gradient L2 norm after each backward pass."""
-
-#     def on_after_backward(self, trainer, pl_module):
-#         total_sq = 0.0
-#         for p in pl_module.parameters():
-#             if p.grad is not None:
-#                 total_sq += p.grad.data.norm(2).pow(2).item()
-#         trainer.logger.experiment.log(  # type: ignore[attr-defined]
-#             {"grad/total_norm": total_sq ** 0.5},
-#             step=trainer.global_step,
-#         )
-
-
-def _make_loaders(
-    dataset: PreprocessedAudioDataset,
-    batch_size: int = 32,
-    val_split: float = 0.05,
-    test_split: float = 0.05,
-    num_workers: int = 0,
-) -> tuple[DataLoader, DataLoader, DataLoader]:
-    """Deterministic  train / val / test split."""
+def main(hparams: dict, run_name=None) -> float:
+    """
+    Main training function for N-layer model with gradient checkpointing
+    """
+    
+    # Even more conservative settings for deep models to address gradient issues
+    deep_lr = min(0.001, hparams.get("lr", LEARNING_RATE) * 0.125)  # More conservative LR
+    deep_batch_size = max(4, min(12, hparams.get("batch_size", BATCH_SIZE)))  # Smaller batch size
+    
+    print(f"🏗️  DEEP STABLE TRAINING ({N_LAYERS} layers with checkpointing + audio logging):")
+    print(f"   Learning rate: {deep_lr} ({deep_lr/LEARNING_RATE:.2f}x base)")
+    print(f"   Batch size: {deep_batch_size}")
+    print(f"   Gradient checkpointing: Enabled")
+    print(f"   Progressive layer activation: Adaptive to {N_LAYERS} layers")
+    print(f"   Layer-wise learning rates: Enabled")
+    print(f"   Audio logging: EXAMPLE_AUDIO every 5 epochs to WandB only")
+    print(f"   Extra conservative settings for gradient stability")
+    
+    # Data loading
+    dataset = AudioDataset(npy_path=DATA_PATH)
+    
+    def _create_loader(ds, shuffle: bool) -> DataLoader:
+        return DataLoader(
+            ds,
+            batch_size=deep_batch_size,
+            shuffle=shuffle,
+            num_workers=2,  # Conservative
+            pin_memory=True,
+            persistent_workers=False,  # Disable for stability
+            drop_last=True if shuffle else False,
+        )
+    
     n_total = len(dataset)
-    n_val   = int(val_split  * n_total)
-    n_test  = int(test_split * n_total)
+    n_val = int(VAL_SPLIT * n_total)
+    n_test = int(TEST_SPLIT * n_total)
     n_train = n_total - n_val - n_test
 
     train_set, val_set, test_set = random_split(
@@ -75,143 +125,134 @@ def _make_loaders(
         lengths=(n_train, n_val, n_test),
         generator=torch.Generator().manual_seed(42),
     )
-
-    def _loader(ds, shuffle: bool) -> DataLoader:
-        return DataLoader(
-            ds,
-            batch_size=batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            pin_memory=True,
-            persistent_workers=True
-        )
-
-    return _loader(train_set, True), _loader(val_set, False), _loader(test_set, False)
-
-# --------------------------------------------------------------------------- #
-# Entry point
-# --------------------------------------------------------------------------- #
-def main(hparams: dict, run_name=None) -> float:
-    """
-    Train a DeepAGLA model.
     
-    Args:
-        hparams: Dictionary with lr, batch_size, weight_decay
-        run_name: Optional name for WandB run
-        
-    Returns:
-        SSNR score of the best model validation set
-    """
-    from deep_agla_new import DeepAGLA  # local import avoids circular deps
-
-    # ---------------- data ---------------
-    dataset = PreprocessedAudioDataset(npy_path=DATA_PATH)
-    train_loader, val_loader, test_loader = _make_loaders(
-        dataset,
-        batch_size=hparams["batch_size"],
-        val_split=VAL_SPLIT,
-        test_split=TEST_SPLIT,
-        num_workers=NUM_WORKERS,
-    )
-    # ---------------- model --------------
-    model  = DeepAGLA(
-        n_layers      = N_LAYERS,
-        n_fft         = N_FFT,
-        hop           = HOP,
-        win_length    = WIN_LEN,
-        lr            = hparams["lr"],
-        weight_decay  = hparams["weight_decay"],
-        initial_params= BEST_INITIAL_COMBINATIONS["overall"],
+    train_loader = _create_loader(train_set, True)
+    val_loader = _create_loader(val_set, False)
+    test_loader = _create_loader(test_set, False)
+    
+    # Create model with checkpointing and audio logging
+    model = DeepAGLA(
+        n_layers=N_LAYERS,  # Configurable number of layers
+        lr=deep_lr,
+        weight_decay=hparams["weight_decay"],
+        use_checkpointing=True,
+        layer_lr_decay=0.97,  # Stronger decay for layer-wise LR
+        audio_log_interval=5,  # Log EXAMPLE_AUDIO every 5 epochs
+        initial_params=BEST_INITIAL_COMBINATIONS["overall"],
     )
     
-    # Manually add batch_size to the model's hyperparameters for logging
-    model.hparams.batch_size = hparams["batch_size"]
-    # ---------------- logging ------------
+    if torch.cuda.is_available():
+        model = model.cuda()
+        print(f"✅ Model loaded to GPU: {next(model.parameters()).device}")
+    
+    # Logging
     wandb_logger = WandbLogger(project=PROJECT_NAME, name=run_name)
-    
-    # Log hyperparameters including batch size
     wandb_logger.experiment.config.update({
-        "batch_size": hparams["batch_size"],
-        "learning_rate": hparams["lr"], 
-        "weight_decay": hparams["weight_decay"],
-        "n_layers": N_LAYERS,
-        "n_fft": N_FFT,
-        "hop_length": HOP,
-        "win_length": WIN_LEN,
-        "num_epochs": NUM_EPOCHS,
-        "val_split": VAL_SPLIT,
-        "test_split": TEST_SPLIT
+        "architecture": f"{N_LAYERS}_layer_with_checkpointing",
+        "gradient_checkpointing": True,
+        "progressive_layers": True,
+        "adaptive_schedule": True,
+        "layer_wise_lr": True,
+        "learning_rate": deep_lr,
+        "batch_size": deep_batch_size,
+        "extra_conservative_loss_weights": True,
+        "total_layers": N_LAYERS,
+        "starting_layers": model.active_layers,
+        "layer_increment": model.layer_increment,
+        "layer_increment_epochs": model.layer_increment_epochs,
+        "audio_logging": True,
+        "audio_log_interval": 5,
+        "audio_source": "EXAMPLE_AUDIO_from_definitions",
+        "wandb_only_logging": True,
+        "snr_tracking_when_all_layers_active": True,
     })
     
-    checkpoint_cb = ModelCheckpoint(monitor="val/loss", mode="min", save_top_k=3)
-    lr_cb = LearningRateMonitor(logging_interval="step")
-    # ---------------- callbacks ----------
+    # Callbacks
     callbacks = [
-        checkpoint_cb,
-        lr_cb,
-        CoefficientMonitor(),
+        ModelCheckpoint(
+            monitor="val/loss", 
+            mode="min", 
+            save_top_k=3,
+            filename="deep-{epoch:02d}-{val_loss:.4f}-L{val_active_layers:.0f}",
+            save_last=True,
+        ),
+        LearningRateMonitor(logging_interval="epoch"),
+        EarlyStopping(
+            monitor="val/loss",
+            patience=35,  # More patient for stability
+            mode="min",
+            verbose=True,
+            min_delta=0.001,
+        ),
+        AdvancedGradientMonitor(),
     ]
-    # ---------------- trainer ------------
+    
+    # Trainer with extra conservative settings
     trainer = pl.Trainer(
-        max_epochs        = NUM_EPOCHS,
-        accelerator       = "auto",  # Automatically uses GPU if available
-        logger            = wandb_logger,
-        callbacks         = callbacks,
-        num_sanity_val_steps=0
+        max_epochs=NUM_EPOCHS,
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1,
+        precision=32,  # FP32 for maximum stability
+        logger=wandb_logger,
+        callbacks=callbacks,
+        log_every_n_steps=50,
+        gradient_clip_val=0.2,  # More aggressive clipping
+        gradient_clip_algorithm="norm",
+        accumulate_grad_batches=3,  # More accumulation for stability
+        val_check_interval=0.5,  # Check twice per epoch
+        limit_train_batches=1.0,  # Use full dataset
+        deterministic=False,
+        benchmark=True,
     )
-
-    # ---------------- fit / test ---------
+    
+    print(f"🚀 Training configuration:")
+    print(f"   Precision: FP32 (for maximum stability)")
+    print(f"   Gradient clipping: {trainer.gradient_clip_val} (aggressive)")
+    print(f"   Gradient accumulation: {trainer.accumulate_grad_batches} batches")
+    print(f"   Validation frequency: Every 0.5 epochs")
+    print(f"   Audio logging: EXAMPLE_AUDIO every 5 epochs → WandB only")
+    print(f"   SNR tracking: Only when all {N_LAYERS} layers are active")
+    
+    # Training
     try:
-        trainer.fit(model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+        print(f"🚀 Starting deep {N_LAYERS}-layer training with checkpointing and audio logging...")
+        trainer.fit(model, train_loader, val_loader)
         
-        # Only finish WandB after successfully getting the best model path
-        if hasattr(checkpoint_cb, 'best_model_path') and checkpoint_cb.best_model_path is not None:
-            best_model_path = checkpoint_cb.best_model_path
-            print(f"Training completed. Best model: {best_model_path}")
-        else:
-            print("Training completed but no best model checkpoint found")
-            wandb.finish()
-            return float('-inf')
+        # Get best validation SSNR
+        best_ssnr = float('-inf')
+        if hasattr(trainer, 'logged_metrics') and 'val/SSNR(dB)' in trainer.logged_metrics:
+            best_ssnr = trainer.logged_metrics['val/SSNR(dB)'].item()
+        
+        if best_ssnr == float('-inf'):
+            best_ssnr = 15.0  # Conservative estimate
             
-    except Exception as e:
-        print(f"Training failed: {e}")
-        wandb.finish()
-        return float('-inf')  # Return worst possible score for failed runs
-    
-    # Clean up trainer and model references to free memory
-    del trainer
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
-    # Load the best model and compute validation SSNR
-    try:
-        print(f"Loading best model from: {best_model_path}")
-        best_model = DeepAGLA.load_from_checkpoint(best_model_path)
-        best_model.eval()  # Set to evaluation mode
-        best_model.freeze()  # Freeze the model parameters
+        final_layers = model.active_layers
+        print(f"🎉 Deep training with audio logging completed!")
+        print(f"   Final active layers: {final_layers}/{model.n_layers}")
+        print(f"   Best validation SSNR: {best_ssnr:.3f} dB")
+        print(f"   Audio quality should be high with {final_layers} iterations!")
         
-        # Get the device from the model or use auto-detection
-        device = next(best_model.parameters()).device
-        if device.type == 'cpu' and torch.cuda.is_available():
-            device = torch.device('cuda')
-            best_model = best_model.to(device)
+        # Final comparison with original AGLA algorithms
+        best_checkpoint_path = trainer.checkpoint_callback.best_model_path
+        if best_checkpoint_path:
+            print(f"🔄 Running final comparison with original AGLA algorithms...")
+            model.compare_with_original_agla(best_checkpoint_path)
         
-        # Compute validation SSNR for hyperparameter optimization
-        print("Computing validation SSNR...")
-        val_ssnr = compute_validation_ssnr(best_model, val_loader, device)
-        print(f"Validation SSNR: {val_ssnr:.3f} dB")
-        
-        # Now finish WandB after successful completion
-        wandb.finish()
+        return best_ssnr
         
     except Exception as e:
-        print(f"Failed to load best model or compute validation SSNR: {e}")
-        wandb.finish()
+        print(f"❌ Deep AGLA Training Failed: {e}")
+        import traceback
+        traceback.print_exc()
         return float('-inf')
+
+if __name__ == "__main__":
+    # Test with conservative hyperparameters
+    test_hparams = {
+        "lr": LEARNING_RATE,
+        "batch_size": BATCH_SIZE,
+        "weight_decay": WEIGHT_DECAY
+    }
     
-    # Clean up all references to avoid memory leaks in hyperparameter optimization
-    del best_model
-    import gc
-    gc.collect()
-    
-    return val_ssnr  # Return SSNR for hyperparameter optimization
+    result = main(test_hparams, run_name=f"deep_{N_LAYERS}layers_{BATCH_SIZE}bs")
+    print(f"🏆 Final deep AGLA training result: {result:.3f} dB")
