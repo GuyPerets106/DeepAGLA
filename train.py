@@ -91,7 +91,12 @@ def main(hparams: dict, run_name=None) -> float:
     # Even more conservative settings for deep models to address gradient issues
     deep_lr = min(0.001, hparams.get("lr", LEARNING_RATE) * 0.125)  # More conservative LR
     deep_batch_size = max(4, min(12, hparams.get("batch_size", BATCH_SIZE)))  # Smaller batch size
-    
+    loss_weights = {
+        "time_l1": hparams.get("loss_weight_time_l1", 0.5),
+        "time_mse": hparams.get("loss_weight_time_mse", 0.5),
+        "spec_l1": hparams.get("loss_weight_spec_l1", 0.5),
+        "log_spec_l1": hparams.get("loss_weight_log_spec_l1", 0.5),
+    }
     print(f"🏗️  DEEP STABLE TRAINING ({N_LAYERS} layers with checkpointing + audio logging):")
     print(f"   Learning rate: {deep_lr} ({deep_lr/LEARNING_RATE:.2f}x base)")
     print(f"   Batch size: {deep_batch_size}")
@@ -139,6 +144,7 @@ def main(hparams: dict, run_name=None) -> float:
         layer_lr_decay=0.97,  # Stronger decay for layer-wise LR
         audio_log_interval=5,  # Log EXAMPLE_AUDIO every 5 epochs
         initial_params=BEST_INITIAL_COMBINATIONS["overall"],
+        loss_weights=loss_weights,
     )
     
     if torch.cuda.is_available():
@@ -160,6 +166,7 @@ def main(hparams: dict, run_name=None) -> float:
         "starting_layers": model.active_layers,
         "layer_increment": model.layer_increment,
         "layer_increment_epochs": model.layer_increment_epochs,
+        "loss_weights": loss_weights,
         "audio_logging": True,
         "audio_log_interval": 5,
         "audio_source": "EXAMPLE_AUDIO_from_definitions",
@@ -224,7 +231,7 @@ def main(hparams: dict, run_name=None) -> float:
             best_ssnr = trainer.logged_metrics['val/SSNR(dB)'].item()
         
         if best_ssnr == float('-inf'):
-            best_ssnr = 15.0  # Conservative estimate
+            best_ssnr = -999.99  # Conservative estimate
             
         final_layers = model.active_layers
         print(f"🎉 Deep training with audio logging completed!")
@@ -234,25 +241,37 @@ def main(hparams: dict, run_name=None) -> float:
         
         # Final comparison with original AGLA algorithms
         best_checkpoint_path = trainer.checkpoint_callback.best_model_path
+        print(f"Best checkpoint path: {best_checkpoint_path}")
         if best_checkpoint_path:
             print(f"🔄 Running final comparison with original AGLA algorithms...")
             model.compare_with_original_agla(best_checkpoint_path)
         
+        wandb.finish()
         return best_ssnr
         
     except Exception as e:
         print(f"❌ Deep AGLA Training Failed: {e}")
         import traceback
         traceback.print_exc()
-        return float('-inf')
+        wandb.finish()
+        return -999.99
 
 if __name__ == "__main__":
     # Test with conservative hyperparameters
     test_hparams = {
-        "lr": LEARNING_RATE,
-        "batch_size": BATCH_SIZE,
-        "weight_decay": WEIGHT_DECAY
+        "lr": 0.001,
+        "batch_size": 64,
+        "weight_decay": 0.0003250396612363188
     }
+    
+    loss_weights = {
+        "time_l1": 0.9,
+        "time_mse": 0.9,
+        "spec_l1": 0.1,
+        "log_spec_l1": 0.1,
+    }
+    
+    test_hparams.update(loss_weights)
     
     result = main(test_hparams, run_name=f"deep_{N_LAYERS}layers_{BATCH_SIZE}bs")
     print(f"🏆 Final deep AGLA training result: {result:.3f} dB")

@@ -179,6 +179,7 @@ class DeepAGLA(pl.LightningModule):
         use_checkpointing: bool = True,
         layer_lr_decay: float = 0.95,
         audio_log_interval: int = 5,  # Log audio every N epochs
+        loss_weights: Dict[str, float] = None,  # Loss weights for different components
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
@@ -190,6 +191,7 @@ class DeepAGLA(pl.LightningModule):
         self.n_layers = int(n_layers)
         self.use_checkpointing = use_checkpointing
         self.audio_log_interval = audio_log_interval
+        self.loss_weights = loss_weights
         
         # Import STFT/ISTFT from existing deep_agla.py
         from deep_agla import STFT, ISTFT, AGLALayer
@@ -224,6 +226,7 @@ class DeepAGLA(pl.LightningModule):
         self.setup_reference_audio()
         
         print(f"🏗️  Created {n_layers}-layer model with gradient checkpointing")
+        print(f"   Loss Weights: {self.loss_weights}")
         print(f"   Starting with {self.active_layers} active layers")
         print(f"   Will add {self.layer_increment} layers every {self.layer_increment_epochs} epochs")
         print(f"   Checkpointing: {'Enabled' if use_checkpointing else 'Disabled'}")
@@ -634,10 +637,10 @@ class DeepAGLA(pl.LightningModule):
         
         # MUCH more conservative loss weights for deep models
         total_loss = (
-            0.3 * time_l1 +      # Further reduced for stability
-            0.1 * time_mse +     # Further reduced 
-            0.4 * spec_l1 +      # Further reduced from 0.6
-            0.05 * log_spec_l1   # Further reduced from 0.1
+            self.loss_weights["time_l1"]     * time_l1  +
+            self.loss_weights["time_mse"]    * time_mse +
+            self.loss_weights["spec_l1"]     * spec_l1  +
+            self.loss_weights["log_spec_l1"] * log_spec_l1
         )
         
         return {

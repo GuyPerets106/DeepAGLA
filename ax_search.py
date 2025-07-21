@@ -20,8 +20,12 @@ from train import main as train_once
 # ---------------------------------------------------------------------------
 PARAMS = [
     {"name": "lr", "type": "range", "bounds": [1e-4, 1e-2], "value_type": "float", "log_scale": True},
-    {"name": "batch_size", "type": "choice", "values": [4, 8, 16], "value_type": "int", "is_ordered": True, "sort_values": True},
-    {"name": "weight_decay", "type": "range", "bounds": [1e-5, 1e-2], "value_type": "float", "log_scale": True}
+    {"name": "batch_size", "type": "choice", "values": [64, 128, 256], "value_type": "int", "is_ordered": True, "sort_values": True},
+    {"name": "weight_decay", "type": "range", "bounds": [1e-5, 1e-2], "value_type": "float", "log_scale": True},
+    {"name": "loss_weight_time_l1", "type": "range", "bounds": [0.1, 0.9], "value_type": "float"},
+    {"name": "loss_weight_time_mse", "type": "range", "bounds": [0.1, 0.9], "value_type": "float"},
+    {"name": "loss_weight_spec_l1", "type": "range", "bounds": [0.1, 0.9], "value_type": "float"},
+    {"name": "loss_weight_log_spec_l1", "type": "range", "bounds": [0.1, 0.9], "value_type": "float"}
 ]
 
 # ---------------------------------------------------------------------------
@@ -32,7 +36,7 @@ def run_one_trial_internal(parameterization, run_name=None) -> Dict[str, float]:
     """Run a single optimization trial with the given parameters."""
     try:
         # Create args for the trial
-        tag = f"trial_lr{parameterization['lr']}_bs{parameterization['batch_size']}_wd{parameterization['weight_decay']}"
+        tag = f"trial_lr{parameterization['lr']:.4f}_bs{parameterization['batch_size']}_wd{parameterization['weight_decay']:.4f}_weight_time_l1{parameterization['loss_weight_time_l1']:.2f}_weight_time_mse{parameterization['loss_weight_time_mse']:.2f}_weight_spec_l1{parameterization['loss_weight_spec_l1']:.2f}_weight_log_spec_l1{parameterization['loss_weight_log_spec_l1']:.2f}"
         out_fold = os.path.join("/gpfs0/bgu-benshimo/users/guyperet/DeepAGLA/ax_trials", tag)
         os.makedirs(os.path.join(out_fold, "checkpoint"), exist_ok=True)
         
