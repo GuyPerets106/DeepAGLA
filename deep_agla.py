@@ -218,6 +218,8 @@ class DeepAGLA(pl.LightningModule):
         # Adaptive progressive training based on total number of layers
         self.setup_progressive_schedule()
         
+        self.update_layer_gradients()
+        
         # Audio logging setup
         self.reference_audio = None
         self.reference_logged = False  # Track if reference was logged once
@@ -227,11 +229,10 @@ class DeepAGLA(pl.LightningModule):
         
         print(f"🏗️  Created {n_layers}-layer model with gradient checkpointing")
         print(f"   Loss Weights: {self.loss_weights}")
-        print(f"   Starting with {self.active_layers} active layers")
-        print(f"   Will add {self.layer_increment} layers every {self.layer_increment_epochs} epochs")
-        print(f"   Checkpointing: {'Enabled' if use_checkpointing else 'Disabled'}")
+        print(f"   Will activate {self.layer_increment} more layers for learning every {self.layer_increment_epochs} epochs")
         print(f"   Audio logging: every {audio_log_interval} epochs")
-
+        
+        
     def setup_progressive_schedule(self):
         """Setup adaptive progressive layer activation based on total layers."""
         # Adaptive schedule based on total number of layers
@@ -569,18 +570,20 @@ class DeepAGLA(pl.LightningModule):
         return s * torch.exp(1j * torch.angle(c))
     
     def forward_chunk(self, c, t_prev, d_prev, s, start_layer, end_layer):
-        """Forward pass through a chunk of layers (for checkpointing)"""
+        """Forward pass through a chunk of layers (for checkpointing) - only active layers"""
         for i in range(start_layer, end_layer):
             if i >= len(self.layers):
                 break
+            
             layer = self.layers[i]
             c, t, d = layer(c, t_prev, d_prev, s, self.proj_pc1, self.proj_pc2)
             t_prev = t.clone()
             d_prev = d.clone()
+        
         return c, t_prev, d_prev
 
     def forward(self, sig: torch.Tensor) -> torch.Tensor:
-        """Forward pass with gradient checkpointing and progressive layers"""
+        """Forward pass with all layers, gradients controlled by param.requires_grad"""
         # Get magnitude spectrogram
         s = torch.abs(self.stft(sig))
         
@@ -590,24 +593,32 @@ class DeepAGLA(pl.LightningModule):
         d_prev = t_prev.clone()
         c = t_prev.clone()
         
-        # Use only active layers (progressive training)
+        # ALWAYS use all layers for forward pass
         current_active = min(self.active_layers, self.n_layers)
         
         if self.use_checkpointing and self.training:
-            # Process in chunks of 8 layers with checkpointing
+            # Process active layers with checkpointing (these get gradients)
             chunk_size = 8
             for chunk_start in range(0, current_active, chunk_size):
                 chunk_end = min(chunk_start + chunk_size, current_active)
                 
-                # Use gradient checkpointing for this chunk
+                # Use gradient checkpointing for active layers
                 c, t_prev, d_prev = checkpoint(
                     self.forward_chunk,
                     c, t_prev, d_prev, s, chunk_start, chunk_end,
                     use_reentrant=False
                 )
+            
+            # Process remaining layers normally (gradients controlled by param.requires_grad)
+            if current_active < self.n_layers:
+                for i in range(current_active, self.n_layers):
+                    layer = self.layers[i]
+                    c, t, d = layer(c, t_prev, d_prev, s, self.proj_pc1, self.proj_pc2)
+                    t_prev = t.clone()
+                    d_prev = d.clone()
         else:
-            # Regular forward pass (validation/testing or no checkpointing)
-            for i in range(current_active):
+            # Regular forward pass - ALL layers, gradients controlled by param.requires_grad
+            for i in range(self.n_layers):  # ALWAYS all layers
                 layer = self.layers[i]
                 c, t, d = layer(c, t_prev, d_prev, s, self.proj_pc1, self.proj_pc2)
                 t_prev = t.clone()
@@ -616,6 +627,15 @@ class DeepAGLA(pl.LightningModule):
         # Convert back to time domain
         predicted_signals = self.istft(c, length=sig.size(1))
         return predicted_signals
+    
+    def update_layer_gradients(self):
+        """Enable/disable gradients for layers based on active_layers."""
+        for i, layer in enumerate(self.layers):
+            requires_grad = i < self.active_layers
+            
+            # Set requires_grad for all parameters in this layer
+            for param in layer.parameters():
+                param.requires_grad = requires_grad
     
     def compute_loss(self, pred_signals: torch.Tensor, target_signals: torch.Tensor) -> Dict[str, torch.Tensor]:
         """Compute loss with much more conservative weights"""
@@ -652,7 +672,7 @@ class DeepAGLA(pl.LightningModule):
         }
     
     def on_train_epoch_start(self):
-        """Progressively activate more layers with adaptive schedule"""
+        """Progressively activate more layers for gradient updates (not forward pass)"""
         if self.current_epoch > 0 and self.current_epoch % self.layer_increment_epochs == 0:
             if self.active_layers < self.n_layers:
                 old_active = self.active_layers
@@ -660,15 +680,21 @@ class DeepAGLA(pl.LightningModule):
                     self.active_layers + self.layer_increment, 
                     self.n_layers
                 )
-                print(f"🔄 Epoch {self.current_epoch}: Activated layers {old_active} → {self.active_layers}")
+                print(f"🔄 Epoch {self.current_epoch}: Layers learning gradients {old_active} → {self.active_layers}")
+                print(f"   Forward pass: Always uses all {self.n_layers} layers")
+                print(f"   Backward pass: Only {self.active_layers} layers get parameter updates")
                 
                 # Log layer activation
                 if hasattr(self.logger, 'experiment'):
                     self.logger.experiment.log({
                         "training/active_layers": self.active_layers,
                         "training/layer_progress": self.active_layers / self.n_layers,
+                        "training/total_forward_layers": self.n_layers,
                     }, step=self.global_step)
-
+                    
+        # Update which layers can receive gradients
+        self.update_layer_gradients()
+                    
     def on_train_epoch_end(self):
         """Called at the end of each training epoch."""
         epoch = self.current_epoch
@@ -676,7 +702,82 @@ class DeepAGLA(pl.LightningModule):
         # Log audio reconstruction every N epochs
         if epoch % self.audio_log_interval == 0:
             self.log_audio_reconstruction(epoch)
+        
+        # Log parameter changes every epoch
+        self.log_parameter_changes_from_init()
+
+    def log_parameter_changes_from_init(self):
+        """Log how much parameters have changed from their initial values."""
+        try:
+            # Store initial parameters once during model creation instead of creating new model
+            if not hasattr(self, 'initial_params_stored'):
+                self.initial_params_stored = {}
+                temp_hparams = dict(self.hparams)
+                temp_model = DeepAGLA(**temp_hparams)
+                
+                for i, layer in enumerate(temp_model.layers):
+                    self.initial_params_stored[i] = {
+                        'alpha': layer.alpha.item(),
+                        'beta': layer.beta.item(), 
+                        'gamma': layer.gamma.item()
+                    }
+                del temp_model
             
+            # Compare current vs initial values for sample layers
+            sample_layers = [0, min(self.n_layers//2, self.n_layers-1), self.n_layers-1]
+            sample_layers = list(set(sample_layers))  # Remove duplicates
+            
+            total_change = 0.0
+            max_change = 0.0
+            active_changes = 0.0
+            inactive_changes = 0.0
+            
+            for layer_idx in sample_layers:
+                if layer_idx < len(self.layers) and layer_idx in self.initial_params_stored:
+                    current_layer = self.layers[layer_idx]
+                    init_params = self.initial_params_stored[layer_idx]
+                    
+                    # Calculate changes
+                    alpha_change = abs(current_layer.alpha.item() - init_params['alpha'])
+                    beta_change = abs(current_layer.beta.item() - init_params['beta'])
+                    gamma_change = abs(current_layer.gamma.item() - init_params['gamma'])
+                    
+                    layer_total_change = alpha_change + beta_change + gamma_change
+                    total_change += layer_total_change
+                    max_change = max(max_change, max(alpha_change, beta_change, gamma_change))
+                    
+                    # Track active vs inactive layer changes
+                    if layer_idx < self.active_layers:
+                        active_changes += layer_total_change
+                    else:
+                        inactive_changes += layer_total_change
+                    
+                    # Log individual changes
+                    self.log(f"param_changes/layer_{layer_idx:02d}/alpha_change", alpha_change, 
+                            on_step=False, on_epoch=True, sync_dist=False)
+                    self.log(f"param_changes/layer_{layer_idx:02d}/beta_change", beta_change, 
+                            on_step=False, on_epoch=True, sync_dist=False)
+                    self.log(f"param_changes/layer_{layer_idx:02d}/gamma_change", gamma_change, 
+                            on_step=False, on_epoch=True, sync_dist=False)
+                    self.log(f"param_changes/layer_{layer_idx:02d}/total_change", layer_total_change, 
+                            on_step=False, on_epoch=True, sync_dist=False)
+                    
+                    # Log whether layer is active
+                    self.log(f"param_changes/layer_{layer_idx:02d}/is_active", 
+                            float(layer_idx < self.active_layers), on_step=False, on_epoch=True, sync_dist=False)
+            
+            # Log overall statistics
+            self.log("param_changes/total_change", total_change, on_step=False, on_epoch=True, 
+                    prog_bar=True, sync_dist=False)
+            self.log("param_changes/max_change", max_change, on_step=False, on_epoch=True, sync_dist=False)
+            self.log("param_changes/avg_change", total_change / len(sample_layers) if sample_layers else 0.0, 
+                    on_step=False, on_epoch=True, sync_dist=False)
+            self.log("param_changes/active_layers_change", active_changes, on_step=False, on_epoch=True, sync_dist=False)
+            self.log("param_changes/inactive_layers_change", inactive_changes, on_step=False, on_epoch=True, sync_dist=False)
+            
+        except Exception as e:
+            print(f"⚠️ Error logging parameter changes: {e}")  
+                      
     def set_inference_mode(self, use_all_layers=True):
         """Set model to use all layers for inference, regardless of training progress."""
         if use_all_layers:
@@ -776,23 +877,94 @@ class DeepAGLA(pl.LightningModule):
         self.log("train/time_l1", losses['time_l1'], on_step=False, on_epoch=True)
         self.log("train/spec_l1", losses['spec_l1'], on_step=False, on_epoch=True)
         
+        if self.global_step % 100 == 0:
+            self.log_parameter_progression()
+        
         return losses['total']
+    
+    def log_parameter_progression(self):
+        """Log the current values of alpha, beta, gamma parameters for monitoring learning."""
+        try:
+            # Sample key layers for monitoring (first, middle, last few layers)
+            sample_layers = []
+            
+            # Always monitor first 3 layers
+            sample_layers.extend(range(min(3, self.n_layers)))
+            
+            # Add middle layer if model is large enough
+            if self.n_layers > 10:
+                sample_layers.append(self.n_layers // 2)
+            
+            # Add last few layers
+            if self.n_layers > 5:
+                sample_layers.extend(range(max(0, self.n_layers - 2), self.n_layers))
+            
+            # Remove duplicates and sort
+            sample_layers = sorted(list(set(sample_layers)))
+            
+            for layer_idx in sample_layers:
+                if layer_idx < len(self.layers):
+                    layer = self.layers[layer_idx]
+                    
+                    # Log current parameter values
+                    self.log(f"params/layer_{layer_idx:02d}/alpha", layer.alpha.item(), 
+                            on_step=True, on_epoch=False)
+                    self.log(f"params/layer_{layer_idx:02d}/beta", layer.beta.item(), 
+                            on_step=True, on_epoch=False)
+                    self.log(f"params/layer_{layer_idx:02d}/gamma", layer.gamma.item(), 
+                            on_step=True, on_epoch=False)
+            
+            # Log parameter statistics across all active layers
+            active_layers = self.layers[:self.active_layers]
+            if active_layers:
+                alphas = [layer.alpha.item() for layer in active_layers]
+                betas = [layer.beta.item() for layer in active_layers]
+                gammas = [layer.gamma.item() for layer in active_layers]
+                
+                # Log statistics
+                self.log("params/stats/alpha_mean", np.mean(alphas), on_step=True, on_epoch=False)
+                self.log("params/stats/alpha_std", np.std(alphas), on_step=True, on_epoch=False)
+                self.log("params/stats/beta_mean", np.mean(betas), on_step=True, on_epoch=False)
+                self.log("params/stats/beta_std", np.std(betas), on_step=True, on_epoch=False)
+                self.log("params/stats/gamma_mean", np.mean(gammas), on_step=True, on_epoch=False)
+                self.log("params/stats/gamma_std", np.std(gammas), on_step=True, on_epoch=False)
+                
+        except Exception as e:
+            print(f"⚠️ Error logging parameter progression: {e}")
 
     def validation_step(self, batch, batch_idx):
         preprocessed_signals = batch.to(self.device, non_blocking=True)
         pred_signals = self(preprocessed_signals)
         losses = self.compute_loss(pred_signals, preprocessed_signals)
         
-        # Compute metrics
+        # Compute metrics with better error handling
         from eval_metrics import match_signals, compute_all_metrics
-        matched_orig, matched_pred = match_signals(preprocessed_signals, pred_signals)
-        metrics = compute_all_metrics(matched_orig, matched_pred)
-        
-        # Log validation metrics
-        self.log("val/loss", losses['total'], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
-        self.log("val/active_layers", float(self.active_layers), on_step=False, on_epoch=True)
-        for k, v in metrics.items():
-            self.log(f"val/{k.replace(' ', '_')}", v, on_step=False, on_epoch=True, 
-                    prog_bar=False, sync_dist=True)
+        try:
+            matched_orig, matched_pred = match_signals(preprocessed_signals, pred_signals)
+            metrics = compute_all_metrics(matched_orig, matched_pred)
+            
+            # Log validation metrics with explicit SNR logging
+            self.log("val/loss", losses['total'], on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
+            self.log("val/active_layers", float(self.active_layers), on_step=False, on_epoch=True)
+            
+            # Log all metrics and ensure SNR is prominently logged
+            for k, v in metrics.items():
+                clean_key = k.replace(' ', '_').replace('(', '').replace(')', '')
+                self.log(f"val/{clean_key}", v, on_step=False, on_epoch=True, 
+                        prog_bar=(k == 'SNR (dB)'), sync_dist=True)  # Show SNR in progress bar
+                
+                # Also log with original formatting for compatibility
+                self.log(f"val/{k.replace(' ', '_')}", v, on_step=False, on_epoch=True, 
+                        prog_bar=False, sync_dist=True)
+            
+            # Explicitly log SNR with a simple name for ModelCheckpoint
+            if 'SNR (dB)' in metrics:
+                self.log("val/SNR_dB", metrics['SNR (dB)'], on_step=False, on_epoch=True, 
+                        prog_bar=True, sync_dist=True)
+                
+        except Exception as e:
+            print(f"⚠️ Error computing validation metrics: {e}")
+            # Log dummy metrics to prevent training from crashing
+            self.log("val/SNR_dB", -999.0, on_step=False, on_epoch=True, sync_dist=True)
             
         return losses['total']

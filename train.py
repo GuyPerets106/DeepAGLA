@@ -76,12 +76,12 @@ class AdvancedGradientMonitor(Callback):
                 }, step=trainer.global_step)
         
         # More aggressive warning thresholds for deep models
-        if total_grad_norm > 50.0:  # Reduced from 100.0
-            print(f"⚠️  High total gradient norm: {total_grad_norm:.2f} at step {trainer.global_step}")
+        # if total_grad_norm > 50.0:  # Reduced from 100.0
+        #     print(f"⚠️  High total gradient norm: {total_grad_norm:.2f} at step {trainer.global_step}")
         
-        if layer_grads and max(layer_grads.values()) > 25.0:  # Reduced from 50.0
-            max_layer = max(layer_grads.keys(), key=lambda x: layer_grads[x])
-            print(f"⚠️  High layer gradient: Layer {max_layer} = {layer_grads[max_layer]:.2f}")
+        # if layer_grads and max(layer_grads.values()) > 25.0:  # Reduced from 50.0
+        #     max_layer = max(layer_grads.keys(), key=lambda x: layer_grads[x])
+        #     print(f"⚠️  High layer gradient: Layer {max_layer} = {layer_grads[max_layer]:.2f}")
 
 def main(hparams: dict, run_name=None) -> float:
     """
@@ -89,13 +89,13 @@ def main(hparams: dict, run_name=None) -> float:
     """
     
     # Even more conservative settings for deep models to address gradient issues
-    deep_lr = min(0.001, hparams.get("lr", LEARNING_RATE) * 0.125)  # More conservative LR
-    deep_batch_size = max(4, min(12, hparams.get("batch_size", BATCH_SIZE)))  # Smaller batch size
+    deep_lr = hparams["lr"]
+    deep_batch_size = hparams["batch_size"]
     loss_weights = {
-        "time_l1": hparams.get("loss_weight_time_l1", 0.5),
-        "time_mse": hparams.get("loss_weight_time_mse", 0.5),
-        "spec_l1": hparams.get("loss_weight_spec_l1", 0.5),
-        "log_spec_l1": hparams.get("loss_weight_log_spec_l1", 0.5),
+        "time_l1": hparams["loss_weight_time_l1"],
+        "time_mse": hparams["loss_weight_time_mse"],
+        "spec_l1": hparams["loss_weight_spec_l1"],
+        "log_spec_l1": hparams["loss_weight_log_spec_l1"],
     }
     print(f"🏗️  DEEP STABLE TRAINING ({N_LAYERS} layers with checkpointing + audio logging):")
     print(f"   Learning rate: {deep_lr} ({deep_lr/LEARNING_RATE:.2f}x base)")
@@ -176,21 +176,31 @@ def main(hparams: dict, run_name=None) -> float:
     
     # Callbacks
     callbacks = [
+        # Save best model based on validation SNR (higher is better)
+        ModelCheckpoint(
+            monitor="val/SNRdB",
+            mode="max",  # Higher SNR is better
+            save_top_k=1,
+            filename="deep-{epoch:02d}-SNR{val/SNRdB:.2f}dB-L{val/active_layers:.0f}",
+            save_last=True,
+            verbose=True
+        ),
         ModelCheckpoint(
             monitor="val/loss", 
             mode="min", 
-            save_top_k=3,
-            filename="deep-{epoch:02d}-{val_loss:.4f}-L{val_active_layers:.0f}",
-            save_last=True,
+            save_top_k=1,
+            filename="backup-{epoch:02d}-{val/loss:.4f}",
+            save_last=False,
+            verbose=False,
         ),
         LearningRateMonitor(logging_interval="epoch"),
-        EarlyStopping(
-            monitor="val/loss",
-            patience=35,  # More patient for stability
-            mode="min",
-            verbose=True,
-            min_delta=0.001,
-        ),
+        # EarlyStopping(
+        #     monitor="val/SNRdB",
+        #     patience=50,
+        #     mode="max",
+        #     verbose=True,
+        #     min_delta=0.05,
+        # ),
         AdvancedGradientMonitor(),
     ]
     
@@ -199,15 +209,14 @@ def main(hparams: dict, run_name=None) -> float:
         max_epochs=NUM_EPOCHS,
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
-        precision=32,  # FP32 for maximum stability
+        precision=32,
         logger=wandb_logger,
         callbacks=callbacks,
         log_every_n_steps=50,
-        gradient_clip_val=0.2,  # More aggressive clipping
+        gradient_clip_val=0.2,
         gradient_clip_algorithm="norm",
-        accumulate_grad_batches=3,  # More accumulation for stability
-        val_check_interval=0.5,  # Check twice per epoch
-        limit_train_batches=1.0,  # Use full dataset
+        val_check_interval=1.0,
+        limit_train_batches=1.0,
         deterministic=False,
         benchmark=True,
     )
@@ -226,28 +235,88 @@ def main(hparams: dict, run_name=None) -> float:
         trainer.fit(model, train_loader, val_loader)
         
         # Get best validation SSNR
+        best_snr = float('-inf')
         best_ssnr = float('-inf')
-        if hasattr(trainer, 'logged_metrics') and 'val/SSNR(dB)' in trainer.logged_metrics:
-            best_ssnr = trainer.logged_metrics['val/SSNR(dB)'].item()
-        
-        if best_ssnr == float('-inf'):
-            best_ssnr = -999.99  # Conservative estimate
-            
+        logged_metrics = trainer.logged_metrics if hasattr(trainer, 'logged_metrics') else {}
+
+        # Try to get the best SNR from different possible metric names
+        for metric_name in ['val/SNRdB', 'val/SNR(dB)', 'val/SNR_dB', 'val/snr', 'val/SNR']:  # Added the correct names
+            if metric_name in logged_metrics:
+                best_snr = logged_metrics[metric_name].item()
+                print(f"✓ Found best {metric_name}: {best_snr:.3f} dB")
+                break
+
+        # Try to get SSNR as well
+        for metric_name in ['val/SSNRdB', 'val/SSNR(dB)', 'val/SSNR_dB', 'val/ssnr', 'val/SSNR']:  # Added the correct names
+            if metric_name in logged_metrics:
+                best_ssnr = logged_metrics[metric_name].item()
+                print(f"✓ Found best {metric_name}: {best_ssnr:.3f} dB")
+                break
+
+        if best_snr == float('-inf'):
+            print("⚠️ Could not find SNR in logged metrics, using conservative estimate")
+            best_snr = -20.0  # Conservative estimate
+
         final_layers = model.active_layers
         print(f"🎉 Deep training with audio logging completed!")
         print(f"   Final active layers: {final_layers}/{model.n_layers}")
-        print(f"   Best validation SSNR: {best_ssnr:.3f} dB")
+        print(f"   Best validation SNR: {best_snr:.3f} dB")
+        print(f"   Best validation SSNR: {best_ssnr:.3f} dB" if best_ssnr != float('-inf') else "   SSNR: Not available")
         print(f"   Audio quality should be high with {final_layers} iterations!")
-        
-        # Final comparison with original AGLA algorithms
+
+        # Save model artifacts to WandB with detailed metadata
         best_checkpoint_path = trainer.checkpoint_callback.best_model_path
         print(f"Best checkpoint path: {best_checkpoint_path}")
+
         if best_checkpoint_path:
+            # Load and verify the best checkpoint
+            best_checkpoint = torch.load(best_checkpoint_path, map_location='cpu')
+            
+            # Create detailed metadata
+            metadata = {
+                "epoch": best_checkpoint.get('epoch', 'N/A'),
+                "global_step": best_checkpoint.get('global_step', 'N/A'),
+                "best_val_snr": best_snr,
+                "best_val_ssnr": best_ssnr if best_ssnr != float('-inf') else None,
+                "n_layers": model.n_layers,
+                "final_active_layers": model.active_layers,
+                "training_complete": model.active_layers >= model.n_layers,
+                "hyperparameters": best_checkpoint.get('hyper_parameters', {}),
+                "model_type": "SNR_optimized",
+            }
+            
+            # Check parameter changes (to verify training effectiveness)
+            sample_layer = model.layers[0]
+            metadata["sample_alpha"] = sample_layer.alpha.item()
+            metadata["sample_beta"] = sample_layer.beta.item()
+            metadata["sample_gamma"] = sample_layer.gamma.item()
+            
+            print(f"📊 Best model metadata: {metadata}")
+            
+            # Create WandB artifact with rich metadata
+            artifact = wandb.Artifact(
+                name=f"deep_agla_{N_LAYERS}layers_best_snr",
+                type="model",
+                description=f"Best SNR DeepAGLA model - {N_LAYERS} layers, epoch {metadata['epoch']}, SNR {best_snr:.2f}dB",
+                metadata=metadata
+            )
+            artifact.add_file(best_checkpoint_path, name="best_snr_model.ckpt")
+            
+            # Log artifact to WandB
+            wandb_logger.experiment.log_artifact(artifact)
+            print(f"✅ Best SNR model artifact saved to WandB")
+            
+            # Also save a summary file
+            import json
+            summary_path = best_checkpoint_path.replace('.ckpt', '_summary.json')
+            with open(summary_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            # Final comparison with original AGLA algorithms
             print(f"🔄 Running final comparison with original AGLA algorithms...")
             model.compare_with_original_agla(best_checkpoint_path)
-        
-        wandb.finish()
-        return best_ssnr
+
+        return best_snr  # Return SNR instead of SSNR
         
     except Exception as e:
         print(f"❌ Deep AGLA Training Failed: {e}")
@@ -260,7 +329,7 @@ if __name__ == "__main__":
     # Test with conservative hyperparameters
     test_hparams = {
         "lr": 0.001,
-        "batch_size": 64,
+        "batch_size": 128,
         "weight_decay": 0.0003250396612363188
     }
     
@@ -271,7 +340,14 @@ if __name__ == "__main__":
         "log_spec_l1": 0.1,
     }
     
-    test_hparams.update(loss_weights)
+    # Update hyperparameters with loss weights
+    test_hparams.update({
+        "loss_weight_time_l1": loss_weights["time_l1"],
+        "loss_weight_time_mse": loss_weights["time_mse"],
+        "loss_weight_spec_l1": loss_weights["spec_l1"],
+        "loss_weight_log_spec_l1": loss_weights["log_spec_l1"],
+    })
+        
     
     result = main(test_hparams, run_name=f"deep_{N_LAYERS}layers_{BATCH_SIZE}bs")
     print(f"🏆 Final deep AGLA training result: {result:.3f} dB")

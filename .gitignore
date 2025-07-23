@@ -11,7 +11,6 @@ wheels/
 **/saspeech_gold_standard
 **/wandb
 *.ckpt
-*.ipynb
 # Virtual environments
 .venv
 *.wav
