@@ -208,5 +208,3 @@ Where:
 - `α, β, γ`: Learnable parameters (initialized based on layer depth)
 - `proj_pc1`: Time-domain consistency projection
 - `proj_pc2`: Magnitude consistency projection
-
-```
